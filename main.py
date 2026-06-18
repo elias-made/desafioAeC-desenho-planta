@@ -1,541 +1,422 @@
-"""
-Space Planner — AeC
-====================
-Fluxo:
-  1. Lê premissas.txt
-  2. Lê planta.xlsx (aba JPIII)
-  3. Gera mapa 2D + resumo de zonas para o LLM
-  4. PlannerAgent orquestra:
-       - Decide o que liberar
-       - Para cada novo espaço: chama BlockDesignerAgent via tool criar_espaco
-  5. Código executa as mudanças na planilha clonada
-  6. Salva Excel + relatório TXT em ./propostas/
-"""
-
 import asyncio
 import json
 import os
 import re
 from copy import copy
+from typing import List, Set, Tuple
+import shutil
 
 import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from ScannerPremissas import scan_orange_context, build_context_string_for_llm
 
-from Agents import PlannerDeps, planner_agent, BlocoLayout
+from Agents import PlannerDeps, orquestrador, posicionador
 from BlockMapper import scan_plant, describe_for_llm
-from mapa_reduzido import scan as scan_map, render, find_region
 
 load_dotenv()
 
-# ── Configuração ─────────────────────────────────────────────────────────
-SHEET_NAME   = 'JPIII'
-CORRIDOR_GAP = 3
-MAP_PADDING  = 3
-MAP_TOP_N    = 2
+SHEET_NAME, CORRIDOR_GAP = 'JPIII', 3
+FORBIDDEN_PATTERNS = {'SALA 1', 'SALA 2', 'SALA 3', 'SALA 4', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4'}
 
-FORBIDDEN_PATTERNS = {
-    'SALA 1', 'SALA1', 'SALA 2', 'SALA2',
-    'SALA 3', 'SALA3', 'SALA 4', 'SALA4',
-    'COWORKING', 'SALA CLIENTE',
-}
+FILL_LIBERADO = PatternFill(start_color='BDC3C7', end_color='BDC3C7', fill_type='solid')
+FILL_NEW_CLIENT = PatternFill(start_color='34495E', end_color='34495E', fill_type='solid')
+FILL_SALA = PatternFill(start_color='FFFFFF', end_color='FFFFFF', fill_type='solid')
 
-_PALETTE = [
-    ('1E8449', '145A32'),
-    ('CB4335', '922B21'),
-    ('7D3C98', '6C3483'),
-    ('1A5276', '154360'),
-    ('B7770D', '9A7D0A'),
-    ('117A65', '0E6655'),
-]
+FONT_WHITE = Font(color='FFFFFF', bold=True, size=8)
+FONT_SMALL = Font(size=8)
+FONT_SALA = Font(color='0000FF', bold=True, size=8)
 
-def _fill(hex_color: str) -> PatternFill:
-    return PatternFill(start_color=hex_color, end_color=hex_color, fill_type='solid')
+THIN_BLUE = Side(border_style="thin", color="0000FF")
+BORDER_SALA = Border(top=THIN_BLUE, left=THIN_BLUE, right=THIN_BLUE, bottom=THIN_BLUE)
 
-FILL_LIBERADO = _fill('BDC3C7')
-FILL_CATRACA  = _fill('F39C12')
-FONT_WHITE    = Font(color='FFFFFF', bold=True, size=8)
-FONT_SMALL    = Font(size=8)
+_bench_partners_cache = {}
 
-
-# ── Carregamento ──────────────────────────────────────────────────────────
+def get_bench_partner(c, ws):
+    global _bench_partners_cache
+    if not _bench_partners_cache:
+        pa_cols = set()
+        for r in range(1, min(200, ws.max_row + 1)):
+            for col in range(1, ws.max_column + 1):
+                val = ws.cell(r, col).value
+                if val is not None:
+                    v_str = str(val).strip().upper()
+                    if v_str not in ('0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
+                        pa_cols.add(col)
+        
+        sorted_cols = sorted(list(pa_cols))
+        i = 0
+        while i < len(sorted_cols) - 1:
+            c1, c2 = sorted_cols[i], sorted_cols[i+1]
+            if c2 == c1 + 1:
+                _bench_partners_cache[c1] = c2
+                _bench_partners_cache[c2] = c1
+                i += 2
+            else:
+                i += 1
+    return _bench_partners_cache.get(c)
 
 def load_plant(path='planta.xlsx', sheet=SHEET_NAME):
     wb = openpyxl.load_workbook(path, data_only=True)
-    ws = wb[sheet]
-    print(f"  Planta: '{ws.title}' — {ws.max_row}L × {ws.max_column}C")
-    return wb, ws
-
+    return wb, wb[sheet]
 
 def clone_ws(ws):
     new_wb = openpyxl.Workbook()
     new_ws = new_wb.active
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
-            src = ws.cell(r, c)
-            tgt = new_ws.cell(r, c)
+            src, tgt = ws.cell(r, c), new_ws.cell(r, c)
             tgt.value = src.value
             if src.has_style:
-                tgt.font      = copy(src.font)
-                tgt.fill      = copy(src.fill)
-                tgt.alignment = copy(src.alignment)
-                tgt.border    = copy(src.border)
-    for col_l, dim in ws.column_dimensions.items():
-        new_ws.column_dimensions[col_l].width = dim.width
-    for row_i, dim in ws.row_dimensions.items():
-        new_ws.row_dimensions[row_i].height = dim.height
-    if ws.freeze_panes:
-        new_ws.freeze_panes = ws.freeze_panes
+                tgt.font, tgt.fill, tgt.alignment, tgt.border = copy(src.font), copy(src.fill), copy(src.alignment), copy(src.border)
+    for col_l, dim in ws.column_dimensions.items(): new_ws.column_dimensions[col_l].width = dim.width
+    for row_i, dim in ws.row_dimensions.items(): new_ws.row_dimensions[row_i].height = dim.height
     return new_wb, new_ws
 
-
-# ── Contexto para o LLM ───────────────────────────────────────────────────
-
-def build_plant_info(plant_data: dict) -> str:
+def build_plant_info(plant_data):
     client_cells = plant_data['client_cells']
-    lines = ["CÉLULAS POR VALOR NA PLANTA:"]
-    for val in sorted(client_cells, key=lambda v: len(client_cells[v]), reverse=True)[:20]:
-        lines.append(f"  '{val}': {len(client_cells[val])} PAs")
-    lines += ["", "ZONAS DOS CLIENTES MAIS POPULOSOS:"]
-    for val in sorted(client_cells, key=lambda v: len(client_cells[v]), reverse=True)[:3]:
-        lines.append(describe_for_llm(val, client_cells[val], CORRIDOR_GAP))
-    lines += ["", f"ÁREAS PROIBIDAS: {len(plant_data['forbidden'])} células (SALA 1-4, COWORKING)"]
+    lines = ["CÉLULAS POR VALOR NA PLANTA (EXATAMENTE como aparecem nas células):"]
+    for v in sorted(client_cells, key=lambda v: len(client_cells[v]), reverse=True)[:20]:
+        lines.append(f"  '{v}': {len(client_cells[v])} PAs")
     return "\n".join(lines)
 
+def build_blocos_info(plant_data, ws_max_row, ws_max_col, ws=None):
+    if ws is None:
+        return "Nenhum bloco laranja mapeado."
+        
+    IGNORED_TAGS = {
+        'CATRACA', 'ESCANINHOS', 'SALA', 'PUXADINHO', 'COWORKING', 
+        'SALA1', 'SALA2', 'SALA3', 'SALA4', 'SALA CLIENTE'
+    }
+        
+    macro_blocks = scan_orange_context('planta.xlsx', SHEET_NAME)
+    client_cells = plant_data['client_cells']
+    
+    lines = []
+    for idx, block in enumerate(macro_blocks, start=1):
+        b_id = f"vazio-{idx}"
+        r_min, r_max, c_min, c_max = block['bounding_box']
+        
+        lines.append(f"--------------------Bloco {idx} ({b_id})--------------------")
+        lines.append(f"Localização: colunas {get_column_letter(c_min)}-{get_column_letter(c_max)}, linhas {r_min}-{r_max}")
+        
+        if block['texts']:
+            lines.append("📌 Anotações na borda laranjas:")
+            for txt in block['texts']:
+                lines.append(f"  - {txt}")
+        lines.append("")
+        
+        lines.append("Células disponíveis:")
+        
+        clients_in_block = {}
+        empty_count = 0
+        total_cells_in_block = 0
+        
+        for cliente, cells in client_cells.items():
+            cliente_norm = str(cliente).strip()
+            
+            if cliente_norm.upper() in IGNORED_TAGS:
+                continue
+                
+            count = sum(1 for (r, c) in cells if r_min <= r <= r_max and c_min <= c <= c_max)
+            if count > 0:
+                total_cells_in_block += count
+                if cliente_norm.upper() in ('0', 'VAZIO'):
+                    empty_count += count
+                    
+                clients_in_block[cliente_norm] = count
+                
+        for cl, qtd in sorted(clients_in_block.items(), key=lambda x: x[0]):
+            if cl.upper() in ('0', 'VAZIO'):
+                lines.append(f"Célula '{cl}': quantidade: {qtd};")
+            else:
+                lines.append(f"Cliente '{cl}': quantidade: {qtd};")
+                
+        lines.append("")
+        lines.append(f"Células totais ocupadas e desocupadas: {total_cells_in_block}")
+        lines.append(f"Células sem clientes: {empty_count};")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        
+    return "\n".join(lines)
 
-def build_mapa_2d(ws) -> str:
-    cells, client_syms = scan_map(ws)
-    skip   = {'CT', 'CW', 'SA', '##', '  '}
-    ranked = sorted(
-        [(sym, lst) for sym, lst in client_syms.items()
-         if sym not in skip and len(lst) > 5],
-        key=lambda x: len(x[1]), reverse=True,
-    )
-    targets  = [sym for sym, _ in ranked[:MAP_TOP_N]]
-    sections = [
-        "LEGENDA: [XX]=célula  [  ]=vazio  [CT]=catraca  [SA]=sala",
-        "PAREDES: thick vermelho = parede de ambiente",
-        "",
-    ]
-    for target in targets:
-        cell_list = client_syms.get(target, [])
-        if not cell_list:
-            continue
-        r_min, r_max, c_min, c_max = find_region(
-            cell_list, MAP_PADDING, ws.max_row, ws.max_column
-        )
-        if c_max - c_min > 40:
-            from BlockMapper import flood_fill, group_zones
-            zones   = group_zones(flood_fill(set(cell_list)), gap=3)
-            biggest = zones[0] if zones else cell_list
-            r_min, r_max, c_min, c_max = find_region(
-                biggest, MAP_PADDING, ws.max_row, ws.max_column
-            )
-        grid_lines, v_walls, h_walls, ct_desc = render(cells, r_min, r_max, c_min, c_max)
-        sections.append(
-            f"── CLIENTE '{target}' ({len(cell_list)} PAs) "
-            f"— {get_column_letter(c_min)}{r_min}:{get_column_letter(c_max)}{r_max} ──"
-        )
-        sections.extend(grid_lines)
-        sections += ["PAREDES VERTICAIS:"] + (v_walls or ["  (nenhuma)"])
-        sections += ["PAREDES HORIZONTAIS:"] + (h_walls or ["  (nenhuma)"])
-        sections += ["CATRACAS:"] + (ct_desc or ["  (nenhuma)"])
-        sections.append("")
-    return "\n".join(sections)
+def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int]]) -> tuple:
+    from BlockMapper import flood_fill, group_zones
+    log = {'realocadas': {}, 'liberadas': {}, 'avisos': []}
+    
+    cell_values = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if v is not None:
+                cell_values[(r, c)] = str(int(v) if isinstance(v, float) and v == int(v) else v).strip()
+            else:
+                cell_values[(r, c)] = ""
 
+    # 1. Mapeia fontes e preenchimentos originais de todos os clientes ativos da planilha
+    client_fills = {}
+    client_fonts = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            v = cell.value
+            if v is not None:
+                v_str = str(int(v) if isinstance(v, float) and v == int(v) else v).strip().upper()
+                if v_str not in ('0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
+                    if cell.fill and cell.fill.patternType == 'solid':
+                        client_fills[v_str] = copy(cell.fill)
+                    if cell.font:
+                        client_fonts[v_str] = copy(cell.font)
 
-# ── Canvas ────────────────────────────────────────────────────────────────
+    # Cores exclusivas para novos clientes que não existem originalmente na planilha
+    default_new_fills = {
+        'NOVO A': PatternFill(start_color='34495E', end_color='34495E', fill_type='solid'), # Azul escuro
+        'NOVO B': PatternFill(start_color='9B59B6', end_color='9B59B6', fill_type='solid'), # Roxo Amethyst
+    }
+    default_new_fonts = {
+        'NOVO A': Font(color='FFFFFF', bold=True, size=8),
+        'NOVO B': Font(color='FFFFFF', bold=True, size=8),
+    }
 
-def build_canvas_map(premissas: str) -> dict:
-    """
-    Lê as premissas, detecta pedidos de criação de espaço e pré-aloca
-    canvas (linha/coluna de início) para cada um.
+    # Carrega as coordenadas das caixas laranjas dinamicamente
+    macro_blocks = scan_orange_context('planta.xlsx', SHEET_NAME)
 
-    Retorna canvas_map: {nome: {row_start, col_start}}
-    Os nomes são ESP-A, ESP-B, ... na ordem em que aparecem.
-    """
-    ROW_BASE  = 125
-    COL_START = 2
-    col_cursor = COL_START
-    canvas_map = {}
+    freed_by_client = {}
+    non_client_values = {'0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''}
+    active_clients_cache = {v.upper() for v in cell_values.values() if v.upper() not in non_client_values}
+    
+    # Separa as ações em duas fases: Primeiro libera tudo, depois posiciona sobre os espaços livres
+    acoes_liberar = [a for a in proposta.acoes if a.tipo.lower().strip() == 'liberar']
+    acoes_realocar = [a for a in proposta.acoes if a.tipo.lower().strip() in ('realocar', 'alocar')]
+    
+    reduced_clients = {str(a.cliente_a_liberar or a.cliente).strip().upper() for a in acoes_liberar}
 
-    for line in premissas.splitlines():
-        line = line.strip()
-        m_pas  = re.search(r'(\d+)\s*PAs?', line, re.IGNORECASE)
-        if not m_pas or not re.search(r'criar|novo espaço', line, re.IGNORECASE):
-            continue
-        idx  = len(canvas_map) + 1
-        nome = f'ESP-{chr(64 + idx)}'   # ESP-A, ESP-B, ...
-        n_pas = int(m_pas.group(1))
+    def is_safe_cell(r, c, target):
+        if (r, c) not in allowed_cells: return False
+        t_up = target.upper()
+        current_val = cell_values.get((r, c), "").strip().upper()
+        
+        partner_col = get_bench_partner(c, ws)
+        if partner_col:
+            partner_val = cell_values.get((r, partner_col), "").strip().upper()
+            if partner_val and partner_val not in ('0', 'VAZIO', '', t_up) and partner_val not in reduced_clients:
+                if partner_val in active_clients_cache: return False
+        
+        return current_val in non_client_values or current_val == t_up or current_val in reduced_clients
 
-        # Estimativa de largura para espaçar os blocos
-        n_ilhas   = -(-n_pas // 32)
-        est_width = n_ilhas * 3 + 2    # ilhas + sala
+    def fill_bfs(disp, qtd):
+        if not disp or qtd <= 0: return []
+        alocadas = []
+        for bloco in sorted(flood_fill(set(disp)), key=len, reverse=True):
+            for atual in sorted(bloco, key=lambda coord: (coord[1], coord[0])):
+                if len(alocadas) < qtd: alocadas.append(atual)
+        if len(alocadas) < qtd: alocadas.extend([c for c in sorted(disp, key=lambda x: (x[1], x[0])) if c not in alocadas][:qtd - len(alocadas)])
+        return alocadas
 
-        canvas_map[nome] = {
-            'row_start': ROW_BASE,
-            'col_start': col_cursor,
-        }
-        col_cursor += est_width + 4    # margem entre blocos
+    # === FASE 1: LIBERAR (Sempre executada primeiro para criar as mesas '0') ===
+    for acao in acoes_liberar:
+        alvo = str(acao.cliente_a_liberar or acao.cliente).strip()
+        alvo_norm = alvo.upper()
+        
+        target_block = acao.novo_cliente.strip()
+        matching_block = next((b for b in macro_blocks if f"vazio-{macro_blocks.index(b)+1}" == target_block), None)
+        
+        if matching_block:
+            r_min, r_max, c_min, c_max = matching_block['bounding_box']
+            cells_to_free = []
+            for r in range(r_min, r_max + 1):
+                for c in range(c_min, c_max + 1):
+                    if cell_values.get((r, c), "").upper() == alvo_norm:
+                        cells_to_free.append((r, c))
+            target_zone = cells_to_free
+        else:
+            cells_to_free = [k for k, v in cell_values.items() if v.upper() == alvo_norm]
+            zones = group_zones(flood_fill(set(cells_to_free)), gap=CORRIDOR_GAP)
+            target_zone = zones[0] if zones else cells_to_free
+            
+        # Alinha a variável de ordenação fora dos blocos condicionais
+        cells_to_free_sorted = sorted(target_zone, key=lambda coord: (coord[1], coord[0]))
+            
+        for r, c in cells_to_free_sorted[:acao.quantidade]:
+            ws.cell(r, c).value, cell_values[(r, c)] = '0', '0'
+            ws.cell(r, c).fill, ws.cell(r, c).font = FILL_LIBERADO, FONT_SMALL
+            freed_by_client.setdefault(alvo, []).append((r, c))
+            log['liberadas'][(r, c)] = alvo
 
-    return canvas_map
+    # === FASE 2: REALOCAR (Apenas posiciona onde já tem espaço livre '0', 'vazio' ou 'VAZIO') ===
+    for acao in acoes_realocar:
+        pool = []
+        target_block = acao.novo_cliente.strip()
+        
+        # DEFINE CLI_CLEAN NO INÍCIO DO LOOP (Corrige o NameError)
+        cli_clean = re.sub(r'-(complemento|parte|excedente|residuo)', '', str(acao.cliente), flags=re.IGNORECASE).strip()
+        m_novo = re.search(r'novo[-\s]*(?:cliente[-\s]*)?([a-zA-Z0-9]+)', cli_clean, flags=re.IGNORECASE)
+        cli_clean = f"Novo {m_novo.group(1).upper()}" if m_novo else cli_clean[:15]
+        
+        matching_block = next((b for b in macro_blocks if f"vazio-{macro_blocks.index(b)+1}" == target_block), None)
+        
+        if matching_block:
+            r_min, r_max, c_min, c_max = matching_block['bounding_box']
+            
+            # Coleta estritamente células que estão desocupadas ('0', 'VAZIO', 'vazio')
+            for r in range(r_min, r_max + 1):
+                for c in range(c_min, c_max + 1):
+                    val = cell_values.get((r, c), "").upper()
+                    if val in ('0', 'VAZIO', '') and is_safe_cell(r, c, cli_clean):
+                        pool.append((r, c))
+                        
+        elif "liberad" in target_block.lower():
+            client_origem = target_block.replace("-liberado", "").replace("-liberado".upper(), "").strip().upper()
+            matching_key = next((key for key in freed_by_client.keys() if key.upper() == client_origem), None)
+            if matching_key:
+                pool = [(r, c) for r, c in freed_by_client[matching_key] if cell_values.get((r, c), "").upper() in ('0', 'VAZIO') and is_safe_cell(r, c, cli_clean)]
+        
+        dests = fill_bfs(pool, acao.quantidade)
+        
+        if len(dests) < acao.quantidade:
+            geral = [k for k, v in cell_values.items() if v.upper() in ('0', 'VAZIO') and is_safe_cell(k[0], k[1], cli_clean) and k not in dests]
+            dests.extend(fill_bfs(geral, acao.quantidade - len(dests)))
 
+        for dr, dc in dests:
+            ws.cell(dr, dc).value, cell_values[(dr, dc)] = cli_clean, cli_clean
+            
+            # Recupera de forma 100% dinâmica a cor de fundo e a fonte originais mapeadas do cliente
+            fill_to_apply = client_fills.get(cli_clean.upper()) or default_new_fills.get(cli_clean.upper(), FILL_NEW_CLIENT)
+            font_to_apply = FONT_WHITE if cli_clean.upper() in ['NOVO A', 'NOVO B'] else copy(ws.cell(dr, dc).font)
+            
+            ws.cell(dr, dc).fill = fill_to_apply
+            if font_to_apply:
+                ws.cell(dr, dc).font = font_to_apply
+                
+            active_clients_cache.add(cli_clean.upper())
+            log['realocadas'].setdefault(f"{cli_clean} → {target_block}", []).append((dr, dc))
 
-# ── Paredes ────────────────────────────────────────────────────────────────
+    return log, cell_values
 
-def draw_walls_around_block(ws, cells: list):
-    """
-    Aplica bordas thick vermelhas no perímetro externo contínuo do bounding box.
-    Itera sobre TODAS as células do bounding box (incluindo corredores).
-    """
-    if not cells:
-        return
-    wall  = Side(border_style='thick', color='FFFF0000')
-    rows  = [r for r, c in cells]
-    cols  = [c for r, c in cells]
-    r_min, r_max = min(rows), max(rows)
-    c_min, c_max = min(cols), max(cols)
-
-    for c in range(c_min, c_max + 1):
-        cell = ws.cell(r_min, c)
-        b = copy(cell.border)
-        cell.border = Border(top=wall, bottom=b.bottom, left=b.left, right=b.right)
-
-    for c in range(c_min, c_max + 1):
-        cell = ws.cell(r_max, c)
-        b = copy(cell.border)
-        cell.border = Border(top=b.top, bottom=wall, left=b.left, right=b.right)
-
-    for r in range(r_min, r_max + 1):
-        cell = ws.cell(r, c_min)
-        b = copy(cell.border)
-        cell.border = Border(top=b.top, bottom=b.bottom, left=wall, right=b.right)
-
-    for r in range(r_min, r_max + 1):
-        cell = ws.cell(r, c_max)
-        b = copy(cell.border)
-        cell.border = Border(top=b.top, bottom=b.bottom, left=b.left, right=wall)
-
-
-# ── Validação e correção do layout ───────────────────────────────────────
-
-def validate_layout(layout: BlocoLayout, n_pas: int, n_sala: int) -> BlocoLayout:
-    """
-    Verifica e corrige o layout retornado pela LLM:
-      1. Remove ilhas PA que sobrepõem a SALA ou CATRACA
-      2. Ajusta a contagem de PAs se necessário (remove células em excesso da última ilha PA)
-      3. Loga warnings para diagnóstico
-    """
-    from copy import deepcopy
-
-    # Constrói mapa de células ocupadas por tipo
-    occupied: dict[tuple, str] = {}
-    ilhas_ok = []
-
-    # Processa SALA e CATRACA primeiro (têm prioridade)
-    for ilha in layout.ilhas:
-        if ilha.tipo in ('SALA', 'CATRACA'):
-            for dr in range(ilha.altura):
-                for dc in range(ilha.largura):
-                    key = (ilha.row_offset + dr, ilha.col_offset + dc)
-                    occupied[key] = ilha.tipo
-            ilhas_ok.append(ilha)
-
-    # Processa PAs verificando sobreposição
-    pa_total = 0
-    for ilha in layout.ilhas:
-        if ilha.tipo != 'PA':
-            continue
-        conflito = False
-        for dr in range(ilha.altura):
-            for dc in range(ilha.largura):
-                key = (ilha.row_offset + dr, ilha.col_offset + dc)
-                if key in occupied:
-                    print(f"  [Layout] AVISO: ilha PA ({ilha.row_offset},{ilha.col_offset} "
-                          f"{ilha.altura}×{ilha.largura}) sobrepõe {occupied[key]} em {key} — removida")
-                    conflito = True
-                    break
-            if conflito:
-                break
-        if not conflito:
-            for dr in range(ilha.altura):
-                for dc in range(ilha.largura):
-                    occupied[(ilha.row_offset + dr, ilha.col_offset + dc)] = 'PA'
-            pa_total += ilha.altura * ilha.largura
-            ilhas_ok.append(ilha)
-
-    # Ajuste fino: se PAs em excesso, reduz a última ilha PA
-    if pa_total > n_pas:
-        excesso = pa_total - n_pas
-        for i in range(len(ilhas_ok) - 1, -1, -1):
-            if ilhas_ok[i].tipo == 'PA':
-                ilha = ilhas_ok[i]
-                capacidade = ilha.altura * ilha.largura
-                if capacidade <= excesso:
-                    excesso -= capacidade
-                    ilhas_ok.pop(i)
-                else:
-                    # Reduz a altura da ilha
-                    linhas_remover = excesso // ilha.largura
-                    resto = excesso % ilha.largura
-                    nova_altura = ilha.altura - linhas_remover - (1 if resto else 0)
-                    if nova_altura <= 0:
-                        ilhas_ok.pop(i)
-                    else:
-                        ilhas_ok[i] = ilha.model_copy(update={'altura': nova_altura})
-                    excesso = 0
-                if excesso == 0:
-                    break
-    elif pa_total < n_pas:
-        print(f"  [Layout] AVISO: layout gerou {pa_total} PAs mas precisava de {n_pas} — "
-              f"faltam {n_pas - pa_total} PAs (a LLM deve ter cometido erro de contagem)")
-
-    return layout.model_copy(update={'ilhas': ilhas_ok})
-
-def apply_layout(ws, nome: str, layout: BlocoLayout, canvas: dict,
-                 fill_pa: PatternFill, fill_sala: PatternFill) -> tuple[list, list, list]:
-    """
-    Expande as ilhas retangulares do BlocoLayout para coordenadas absolutas
-    e pinta as células na planilha.
-
-    Retorna (pa_cells, sala_cells, catraca_cells).
-    """
-    row_origin = canvas['row_start']
-    col_origin = canvas['col_start']
-
-    pa_cells:      list = []
-    sala_cells:    list = []
-    catraca_cells: list = []
-
-    catraca_border = Border(
-        left=Side(border_style='medium', color='FFFFFF00'),
-        right=Side(border_style='medium', color='FFFFFF00'),
-        top=Side(border_style='medium', color='FFFFFF00'),
-        bottom=Side(border_style='medium', color='FFFFFF00'),
-    )
-
-    for ilha in layout.ilhas:
-        for dr in range(ilha.altura):
-            for dc in range(ilha.largura):
-                r = row_origin + ilha.row_offset + dr
-                c = col_origin + ilha.col_offset + dc
-                if r < 1 or c < 1:
-                    continue
-                cell = ws.cell(r, c)
-
-                if ilha.tipo == 'PA':
-                    cell.value = nome
-                    cell.fill  = fill_pa
-                    cell.font  = FONT_WHITE
-                    pa_cells.append((r, c))
-
-                elif ilha.tipo == 'SALA':
-                    cell.value = f'SALA-{nome}'
-                    cell.fill  = fill_sala
-                    cell.font  = FONT_WHITE
-                    sala_cells.append((r, c))
-
-                elif ilha.tipo == 'CATRACA':
-                    cell.value  = f'CATRACA-{nome}'
-                    cell.fill   = FILL_CATRACA
-                    cell.font   = FONT_WHITE
-                    cell.border = catraca_border
-                    catraca_cells.append((r, c))
-
-    return pa_cells, sala_cells, catraca_cells
-
-
-# ── Execução da proposta ──────────────────────────────────────────────────
-
-def execute(ws, proposta, plant_data: dict, canvas_map: dict) -> dict:
-    """
-    1. Libera células dos clientes indicados
-    2. Para cada ação 'alocar': aplica o layout retornado pelo BlockDesignerAgent
-    3. Desenha paredes ao redor de cada bloco (bounding box PA+SALA)
-    """
-    log = {'liberadas': {}, 'alocadas': {}}
-
-    # ── LIBERAR ──────────────────────────────────────────────────────────
-    for acao in proposta.acoes:
-        if acao.tipo != 'liberar':
-            continue
-        alvo  = acao.cliente_a_liberar or acao.setor
-        count = 0
-        for r in range(1, ws.max_row + 1):
-            for c in range(1, ws.max_column + 1):
-                if count >= acao.quantidade:
-                    break
-                cell = ws.cell(r, c)
-                v    = cell.value
-                if isinstance(v, float) and v == int(v):
-                    v = str(int(v))
-                elif v is not None:
-                    v = str(v).strip()
-                if v == str(alvo).strip():
-                    log['liberadas'][(r, c)] = v
-                    cell.value = '0'
-                    cell.fill  = FILL_LIBERADO
-                    cell.font  = FONT_SMALL
-                    count += 1
-            if count >= acao.quantidade:
-                break
-        print(f"  Liberadas: {count}/{acao.quantidade} células ('{alvo}')")
-
-    # ── ALOCAR ────────────────────────────────────────────────────────────
-    # Os layouts foram salvos na tool criar_espaco dentro do canvas_map.
-    # Percorre os canvas que tiveram layout gerado, na ordem de criação.
-    color_idx = 0
-    for canvas in canvas_map.values():
-        layout = canvas.get('_layout')
-        if layout is None:
-            continue
-
-        # Nome que a LLM usou ao chamar a tool
-        nome = canvas.get('_nome', layout.nome)
-
-        pa_hex, sala_hex = _PALETTE[color_idx % len(_PALETTE)]
-        color_idx += 1
-
-        # Valida e corrige sobreposições antes de aplicar
-        acao_pa  = sum(i.altura * i.largura for i in layout.ilhas if i.tipo == 'PA')
-        acao_sala = sum(i.altura * i.largura for i in layout.ilhas if i.tipo == 'SALA')
-        layout = validate_layout(layout, acao_pa, acao_sala)
-
-        pa_cells, sala_cells, catraca_cells = apply_layout(
-            ws, nome, layout, canvas, _fill(pa_hex), _fill(sala_hex)
-        )
-
-        # Paredes: bounding box das PAs + SALA (a catraca fica fora)
-        all_inner = pa_cells + sala_cells
-        if all_inner:
-            rs = [r for r, c in all_inner]
-            cs = [c for r, c in all_inner]
-            bbox = [(r, c)
-                    for r in range(min(rs), max(rs) + 1)
-                    for c in range(min(cs), max(cs) + 1)]
-            draw_walls_around_block(ws, bbox)
-
-        log['alocadas'][nome] = {
-            'pa': pa_cells, 'sala': sala_cells, 'catraca': catraca_cells
-        }
-        print(f"  {nome}: {len(pa_cells)} PAs + {len(sala_cells)} sala"
-              f" + {len(catraca_cells)} catraca(s)")
-
-    return log
-
-
-# ── Relatório TXT ──────────────────────────────────────────────────────────
-
-def write_report(ws_orig, ws_new, proposta, log, path: str) -> int:
-    changes = []
-    for r in range(1, ws_orig.max_row + 1):
-        for c in range(1, ws_orig.max_column + 1):
-            old = str(ws_orig.cell(r, c).value or '').strip()
-            new = str(ws_new.cell(r, c).value or '').strip()
-            if old != new:
-                changes.append((r, c, get_column_letter(c), old, new))
-
-    def section(title, items):
-        out.append(f"\n{'─'*60}\n{title} ({len(items)})\n{'─'*60}")
-        if not items:
-            out.append("  (nenhuma)")
-            return
-        for r, c, col_l, old, new in sorted(items, key=lambda x: (x[0], x[1])):
-            out.append(f"  {col_l}{r:<4}  {old:>8} → {new}")
-
-    liberadas = [(r, c, cl, o, n) for r, c, cl, o, n in changes if n == '0']
-    catracas  = [(r, c, cl, o, n) for r, c, cl, o, n in changes if 'CATRACA' in n]
-
-    out = [
-        '='*60, 'RELATÓRIO DE MUDANÇAS — SPACE PLAN', '='*60,
-        f"Proposta : {proposta.proposta} — {proposta.nome}",
-        f"Descrição: {proposta.descricao}",
-        f"Custo    : {proposta.custo_obras.upper()}",
-        f"Catracas : {proposta.catracas_novas} nova(s)",
-        "",
-        f"Total de células alteradas: {len(changes)}",
-        f"  Liberadas : {len(liberadas)}",
-    ]
-    for nome, info in log['alocadas'].items():
-        out.append(f"  {nome:<20}: {len(info['pa'])} PAs"
-                   f" + {len(info['sala'])} sala"
-                   f" + {len(info.get('catraca', []))} catraca(s)")
-    out.append(f"  Catracas  : {len(catracas)}")
-
-    section("POSIÇÕES LIBERADAS", liberadas)
-    for nome, info in log['alocadas'].items():
-        section(f"PAs {nome}",
-                [(r, c, get_column_letter(c), '', nome) for r, c in info['pa']])
-        if info['sala']:
-            section(f"SALA {nome}",
-                    [(r, c, get_column_letter(c), '', f'SALA-{nome}') for r, c in info['sala']])
-        if info.get('catraca'):
-            section(f"CATRACAS {nome}",
-                    [(r, c, get_column_letter(c), '', f'CATRACA-{nome}') for r, c in info['catraca']])
-    section("TODAS AS CATRACAS", catracas)
-    out += ['', '='*60, 'FIM', '='*60]
-
+def write_report(ws_orig, ws_new, proposta, log, path: str):
+    changes = [(r, c, get_column_letter(c), str(ws_orig.cell(r, c).value or ''), str(ws_new.cell(r, c).value or ''))
+               for r in range(1, ws_orig.max_row + 1) for c in range(1, ws_orig.max_column + 1) if str(ws_orig.cell(r, c).value or '') != str(ws_new.cell(r, c).value or '')]
     with open(path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(out))
-    return len(changes)
+        f.write(f"PROPOSTA: {proposta.nome}\nCUSTO: {proposta.custo_obras}\n\nALTERACOES: {len(changes)}")
+        if changes:
+            f.write("\n\nDETALHES DAS MUDANCAS:\n")
+            for r, c, col, old, new in sorted(changes, key=lambda x: (x[0], x[1])):
+                f.write(f"  {col}{r}: {old} -> {new}\n")
+        if log.get('avisos'):
+            f.write("\n\nAVISOS:\n")
+            for aviso in log['avisos']:
+                f.write(f"  - {aviso}\n")
 
+def formatar_input_deps(deps: PlannerDeps, prompt_adicional: str = "") -> str:
+    return f"""================================================================================
+INPUT DE AUDITORIA - PARÂMETROS RECEBIDOS PELO AGENTE
+================================================================================
 
-# ── Main ───────────────────────────────────────────────────────────────────
+[PROMPT ADICIONAL ENVIADO]
+{prompt_adicional}
+
+[PREMISSAS DO TXT]
+{deps.premissas}
+
+[ESTRATÉGIA MACRO DEFINIDA]
+{deps.estrategia_macro or '(Nenhuma)'}
+
+[BLOCOS INFO]
+{deps.blocos_info}
+
+[PLANT INFO]
+{deps.plant_info}
+"""
+
+def salvar_auditoria(nome_agente: str, input_data: str, output_data: str, safe_name: str):
+    dir_auditoria = f"propostas/auditoria_{safe_name}"
+    os.makedirs(dir_auditoria, exist_ok=True)
+    with open(f"{dir_auditoria}/{nome_agente}_input.txt", "w", encoding="utf-8") as f:
+        f.write(input_data)
+    with open(f"{dir_auditoria}/{nome_agente}_output.txt", "w", encoding="utf-8") as f:
+        f.write(output_data)
 
 async def main():
-    with open('premissas.txt', encoding='utf-8') as f:
-        premissas = f.read().strip()
-    print("\n== PREMISSAS ==")
-    print(premissas)
+    with open('premissas.txt', encoding='utf-8') as f: 
+        premissas_txt = f.read().strip()
 
-    print("\nCarregando planta...")
+    dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME)
+    premissas_visuais = build_context_string_for_llm(dados_laranjas)
+    premissas_completas = f"{premissas_txt}\n\n{premissas_visuais}"
+
     wb, ws = load_plant()
-
-    print("Analisando zonas...")
     plant_data = scan_plant(ws, FORBIDDEN_PATTERNS)
-    plant_info = build_plant_info(plant_data)
-
-    print("Gerando mapa 2D...")
-    mapa_2d = build_mapa_2d(ws)
-    print(f"  Mapa gerado ({len(mapa_2d.splitlines())} linhas)")
-
-    # Canvas pré-calculado a partir das premissas
-    # O PlannerAgent vai chamar criar_espaco(nome, n_pas, n_sala)
-    # e a tool usa canvas_map para saber onde posicionar cada bloco
-    canvas_map = build_canvas_map(premissas)
-    print(f"  Canvas pré-calculados: {list(canvas_map.keys())}")
-
-    print("\nConsultando PlannerAgent...")
+    
     deps = PlannerDeps(
-        plant_info=plant_info,
-        mapa_2d=mapa_2d,
-        premissas=premissas,
-        canvas_map=canvas_map,
+        plant_info=build_plant_info(plant_data), 
+        mapa_2d="[Mapa Omitido]", 
+        premissas=premissas_completas,
+        blocos_info=build_blocos_info(plant_data, ws.max_row, ws.max_column, ws)
     )
-    result = await planner_agent.run("Gere a proposta de space planning.", deps=deps)
-    proposta = result.output
-    print(f"  → Proposta: {proposta.nome}")
-
+    
+    print("1. Orquestrador definindo Estratégia...")
+    estrategia = await orquestrador.run("Defina a estratégia macro.", deps=deps)
+    deps.estrategia_macro = estrategia.output.model_dump_json()
+    
+    cliente_a_reduzir = estrategia.output.nome_exato_cliente_principal
+    print(f"\n🔍 ALVO DE REDUÇÃO CORRETO IDENTIFICADO PELA IA: '{cliente_a_reduzir}'")
+    
+    allowed_cells = set(plant_data['client_cells'].get(cliente_a_reduzir, []))
+    for k in ('VAZIO', 'vazio', '0'):
+        allowed_cells.update(plant_data['client_cells'].get(k, []))
+        
+    print("2. Posicionador gerando Ações...")
+    prompt_pos = "Gere a proposta detalhada."
+    proposta = await posicionador.run(prompt_pos, deps=deps)
+    
+    print("3. Executando Alocação Bruta...")
     os.makedirs('propostas', exist_ok=True)
-    new_wb, new_ws = clone_ws(ws)
-    new_ws.title = re.sub(r'[:\\/?*\[\]]', '', proposta.nome)[:31]
-    log = execute(new_ws, proposta, plant_data, canvas_map)
-
-    safe      = proposta.nome.lower().replace(' ', '_')[:40]
-    xlsx_path = f"propostas/proposta_{safe}.xlsx"
-    txt_path  = f"propostas/proposta_{safe}_mudancas.txt"
-    json_path = "propostas/proposta_llm.json"
-
-    new_wb.save(xlsx_path)
-    n = write_report(ws, new_ws, proposta, log, txt_path)
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(proposta.model_dump(), f, ensure_ascii=False, indent=2)
-
-    print(f"\n✓ {xlsx_path}")
-    print(f"✓ {txt_path} ({n} células alteradas)")
-    print(f"✓ {json_path}")
-
+    
+    safe = re.sub(r'[^a-zA-Z0-9_]', '', proposta.output.nome.replace(' ', '_'))[:40].lower()
+    dest_file = f"propostas/proposta_{safe}.xlsx"
+    
+    shutil.copy("planta.xlsx", dest_file)
+    
+    new_wb = openpyxl.load_workbook(dest_file)
+    new_ws = new_wb[SHEET_NAME]
+    
+    log, _ = execute_alocacao(new_ws, proposta.output, plant_data, allowed_cells)
+    
+    print("\n4. Salvando resultados...")
+    salvar_auditoria("1_orquestrador", formatar_input_deps(deps, "Defina a estratégia macro."), estrategia.output.model_dump_json(indent=2), safe)
+    salvar_auditoria("2_posicionador", formatar_input_deps(deps, prompt_pos), proposta.output.model_dump_json(indent=2), safe)
+    
+    new_wb.save(dest_file)
+    
+    # --- NOVO: RECALCULA O ESTADO FINAL DOS BLOCOS ---
+    final_plant_data = scan_plant(new_ws, FORBIDDEN_PATTERNS)
+    final_blocos_info = build_blocos_info(final_plant_data, new_ws.max_row, new_ws.max_column, new_ws)
+    
+    # Print no terminal
+    print("\n================================================================================")
+    print("ESTADO FINAL DOS BLOCOS APÓS AS MOVIMENTAÇÕES:")
+    print("================================================================================")
+    print(final_blocos_info)
+    
+    # Salva as auditorias originais dos agentes
+    salvar_auditoria("1_orquestrador", formatar_input_deps(deps, "Defina a estratégia macro."), estrategia.output.model_dump_json(indent=2), safe)
+    salvar_auditoria("2_posicionador", formatar_input_deps(deps, prompt_pos), proposta.output.model_dump_json(indent=2), safe)
+    
+    # Grava o relatório de mudanças principal
+    write_report(ws, new_ws, proposta.output, log, f"propostas/proposta_{safe}_mudancas.txt")
+    
+    # --- NOVO: GRAVA O MAPA FINAL DE BLOCOS EM UM ARQUIVO .TXT INDEPENDENTE ---
+    caminho_relatorio_final = f"propostas/proposta_{safe}_blocos_finais.txt"
+    with open(caminho_relatorio_final, "w", encoding="utf-8") as f:
+        f.write("================================================================================\n")
+        f.write("RELATÓRIO DO ESTADO FINAL DOS BLOCOS APÓS AS MOVIMENTAÇÕES\n")
+        f.write("================================================================================\n\n")
+        f.write(final_blocos_info)
+        
+    print(f"✓ Processo concluído. Arquivos salvos em 'propostas/':")
+    print(f"  - Excel modificado: proposta_{safe}.xlsx")
+    print(f"  - Lista de mudanças: proposta_{safe}_mudancas.txt")
+    print(f"  - Mapa final de blocos (TXT solicitado): proposta_{safe}_blocos_finais.txt")
 
 if __name__ == '__main__':
     asyncio.run(main())

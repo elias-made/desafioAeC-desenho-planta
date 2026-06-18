@@ -20,7 +20,7 @@ def get_model():
         ),
     )
     return BedrockConverseModel(
-        'us.anthropic.claude-sonnet-4-5-20250929-v1:0',
+        'us.anthropic.claude-sonnet-4-6',
         provider=BedrockProvider(bedrock_client=client),
     )
 

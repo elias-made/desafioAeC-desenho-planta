@@ -1,11 +1,5 @@
 """
 BlockMapper — funções puras de geometria para plantas de call center.
-
-Expõe duas coisas para o resto do sistema:
-  scan_plant()         — varre o xlsx uma vez, retorna dados estruturados
-  describe_for_llm()   — gera texto compacto de zonas para o LLM decidir
-  pick_zone()          — seleciona as N células de uma zona coerente
-  pick_sala()          — seleciona células adjacentes para a sala
 """
 
 from collections import deque, defaultdict
@@ -59,10 +53,7 @@ def _block_gap(b1: List[Cell], b2: List[Cell]) -> int:
 
 
 def group_zones(blocks: List[List[Cell]], gap: int) -> List[List[Cell]]:
-    """
-    Agrupa blocos cujo gap ≤ `gap` em zonas (Union-Find).
-    Retorna zonas ordenadas por tamanho decrescente.
-    """
+    """Agrupa blocos cujo gap ≤ `gap` em zonas (Union-Find)."""
     n = len(blocks)
     parent = list(range(n))
 
@@ -87,13 +78,6 @@ def group_zones(blocks: List[List[Cell]], gap: int) -> List[List[Cell]]:
 # ── Leitura da planta ────────────────────────────────────────────────────
 
 def scan_plant(ws, forbidden_patterns: Set[str]) -> Dict:
-    """
-    Varre o worksheet uma única vez.
-
-    Retorna:
-      client_cells: {valor_celula: set(Cell)}
-      forbidden:    set(Cell)   — áreas proibidas (SALA 1-4, COWORKING…)
-    """
     client_cells: Dict[str, Set[Cell]] = {}
     forbidden: Set[Cell] = set()
 
@@ -102,7 +86,6 @@ def scan_plant(ws, forbidden_patterns: Set[str]) -> Dict:
             v = ws.cell(row=r, column=c).value
             if v is None:
                 continue
-            # Normaliza float → int quando aplicável (ex: 1.0 → '1')
             if isinstance(v, float) and v == int(v):
                 v_str = str(int(v))
             else:
@@ -120,13 +103,6 @@ def scan_plant(ws, forbidden_patterns: Set[str]) -> Dict:
 # ── Descrição para o LLM ─────────────────────────────────────────────────
 
 def describe_for_llm(client_value: str, cells: Set[Cell], corridor_gap: int) -> str:
-    """
-    Texto compacto de zonas de um cliente para o LLM.
-    Exemplo:
-      Cliente '1': 778 PAs em 3 zonas
-        Zona 0: 272 PAs — linhas 7-26, colunas AR-BR
-        ...
-    """
     from openpyxl.utils import get_column_letter as gcl
     blocks = flood_fill(cells)
     zones = group_zones(blocks, gap=corridor_gap)
@@ -147,23 +123,11 @@ def describe_for_llm(client_value: str, cells: Set[Cell], corridor_gap: int) -> 
 
 def pick_zone(available: Set[Cell], needed: int,
               forbidden: Set[Cell], corridor_gap: int) -> Tuple[List[Cell], List[Cell]]:
-    """
-    Seleciona `needed` células de uma zona coerente.
-
-    Lógica:
-      1. Remove proibidas
-      2. Flood-fill → blocos
-      3. group_zones → zonas
-      4. Usa a menor zona que caiba tudo (ou a maior se nenhuma basta)
-      5. Retorna (alocadas, restantes)
-    """
     usable = available - forbidden
     if not usable or needed <= 0:
         return [], list(available)
 
     zones = group_zones(flood_fill(usable), gap=corridor_gap)
-
-    # Menor zona suficiente (minimiza "sobras" dentro da zona)
     candidates = [z for z in zones if len(z) >= needed]
     zone = min(candidates, key=len) if candidates else zones[0]
 
@@ -174,14 +138,7 @@ def pick_zone(available: Set[Cell], needed: int,
 def pick_sala(pa_cells: List[Cell], available: Set[Cell],
               sala_size: int, forbidden: Set[Cell],
               corridor_gap: int) -> Tuple[List[Cell], List[Cell]]:
-    """
-    Seleciona `sala_size` células para sala adjacente ao bloco de PAs.
-
-    Prioridade:
-      1. Adjacentes diretas (gap=1)
-      2. Próximas dentro do corredor (gap ≤ corridor_gap)
-      3. Borda do próprio bloco PA (sala dentro do espaço)
-    """
+    """Seleciona células contíguas adjacentes ao bloco para criar a sala."""
     if sala_size <= 0:
         return [], list(available)
 
@@ -219,3 +176,74 @@ def pick_sala(pa_cells: List[Cell], available: Set[Cell],
 
     sala = sorted(candidates)[:sala_size]
     return sala, list(available - set(sala))
+
+
+# ── Detecção de blocos vazios e catracas ─────────────────────────────────
+
+def find_empty_blocks(client_cells: Dict[str, Set[Cell]], ws_max_row: int, ws_max_col: int, 
+                      corridor_gap: int = 3) -> Dict[str, Dict]:
+    """Identifica blocos vazios na planilha utilizando o raio de 1 célula de segurança vertical."""
+    empty_cells = set()
+    for key in ('VAZIO', 'vazio', '0'):
+        empty_cells.update(client_cells.get(key, set()))
+        
+    if not empty_cells:
+        return {}
+    
+    active_cells = set()
+    for client, cells in client_cells.items():
+        client_up = str(client).upper().strip()
+        if client_up not in ('VAZIO', '0', 'SEM POSSIB', 'CT', 'SA', 'CW', '##', ''):
+            active_cells.update(cells)
+    
+    # IMPORTANTE: Ajustado o recuo para 1 célula vertical (preserva espaço contíguo útil)
+    clean_empty_cells = set()
+    for r, c in empty_cells:
+        is_fringe = False
+        for offset in (-1, 1):
+            if (r + offset, c) in active_cells:
+                is_fringe = True
+                break
+        if not is_fringe:
+            clean_empty_cells.add((r, c))
+    
+    if not clean_empty_cells:
+        return {}
+    
+    blocks = flood_fill(clean_empty_cells)
+    zones = group_zones(blocks, gap=corridor_gap)
+    
+    empty_blocks = {}
+    for i, zone in enumerate(zones):
+        r_min = min(r for r, c in zone)
+        r_max = max(r for r, c in zone)
+        c_min = min(c for r, c in zone)
+        c_max = max(c for r, c in zone)
+        
+        empty_blocks[f'vazio-{i+1}'] = {
+            'cells': set(zone),
+            'size': len(zone),
+            'position': (r_min, r_max, c_min, c_max),
+        }
+    
+    return empty_blocks
+
+
+def count_catracas_in_zone(client_cells: Dict[str, Set[Cell]], client: str) -> int:
+    client_zone = client_cells.get(client, set())
+    catraca_count = 0
+    
+    for catraca_key in ['CT', 'CATRACA']:
+        catraca_cells = client_cells.get(catraca_key, set())
+        if client_zone and catraca_cells:
+            for r, c in catraca_cells:
+                for pr, pc in client_zone:
+                    if abs(r - pr) <= 2 and abs(c - pc) <= 2:
+                        catraca_count += 1
+                        break
+    return catraca_count
+
+
+def calculate_catracas_needed(n_pas: int) -> int:
+    import math
+    return max(1, math.ceil(n_pas / 250))
