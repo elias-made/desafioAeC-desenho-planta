@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict, Tuple
 import re
 
 from pydantic import BaseModel, Field
@@ -28,10 +28,10 @@ class Estrategia(BaseModel):
 
 class Acao(BaseModel):
     tipo: str = Field(description="Deve ser estritamente 'liberar' ou 'realocar'.")
-    cliente: str = Field(description="Nome do cliente afetado (ex: 'Cliente 1', 'Novo A')")
+    cliente: str = Field(description="Nome do cliente afetado (ex: '1', 'Novo A', 'Novo B')")
     quantidade: int = Field(description="Quantidade de PAs físicas")
-    novo_cliente: str = Field(default="", description="Bloco destino (ex: 'vazio-1' ou 'vazio-3')")
-    cliente_a_liberar: str = Field(default="", description="Se for realocar ou liberar em bloco específico, indique o cliente de origem (ex: '1' ou '2')")
+    novo_cliente: str = Field(default="", description="Ambiente destino ou origem (ex: 'vazio-3-A' ou 'vazio-6-A')")
+    cliente_a_liberar: str = Field(default="", description="Se for realocar ou liberar em ambiente específico, indique o cliente de origem (ex: '1' ou '2')")
     sala_lugares: int = Field(default=0, description="Quantidade de cadeiras adjacentes a serem convertidas em sala (ex: 4 para Novo A, 1 para Novo B)")
 
 class Proposta(BaseModel):
@@ -68,11 +68,11 @@ Você é o ORQUESTRADOR. Defina a estratégia macro com estas regras matemática
    - Você deve planejar ações para reduzir EXATAMENTE 270 posições do Cliente '1' globais (nem mais, nem menos).
 
 2. REGRA DE MÍNIMO IMPACTO (NÃO MOVER CLIENTES ESTÁVEIS):
-   - **NUNCA movimente ou realoque clientes estáveis** (como o Cliente '2', Cliente '3', etc.) para outros blocos. Mover clientes estáveis gera custos de obra civil e risco de fragmentação secundária.
-   - Sempre prefira balancear e ajustar as quantidades exatas de redução do Cliente '1' entre o Bloco 3 e o Bloco 6 para abrir espaço exato para o Novo A (124 PAs) e Novo B (165 PAs), mantendo os demais clientes 100% intocados em suas posições de origem.
+   - **NUNCA movimente ou realoque clientes estáveis** (como o Cliente '2', Cliente '3', Cliente '0', etc.) para outros blocos. Mover clientes estáveis gera custos de obra civil e risco de fragmentação secundária.
+   - Sempre prefira balancear e ajustar as quantidades exatas de redução do Cliente '1' entre o sub-ambiente 'vazio-3-A' e o sub-ambiente 'vazio-6-A' para abrir espaço exato para o Novo A (124 PAs) e Novo B (165 PAs), mantendo os demais clientes 100% intocados em suas posições de origem.
 
-3. USO DE LIBERAÇÕES CIRÚRGICAS POR BLOCO:
-   - Divida as liberações do Cliente '1' indicando os blocos exatos e as quantidades exatas de redução (ex: liberar 137 no bloco 'vazio-3' e liberar 133 no bloco 'vazio-6'). Isso evita transbordos e garante o balanço de 270 exato.
+3. USO DE LIBERAÇÕES CIRÚRGICAS POR AMBIENTE:
+   - Divida as liberações do Cliente '1' indicando os sub-ambientes exatos e as quantidades exatas de redução (ex: liberar 137 no ambiente 'vazio-3-A' e liberar 133 no ambiente 'vazio-6-A'). Isso evita transbordos e garante o balanço de 270 exato.
 """
 
 posicionador = Agent(model=planner_model, deps_type=PlannerDeps, output_type=Proposta, retries=5)
@@ -100,22 +100,22 @@ CORRETO: {{"cliente": "Novo A", ...}}
 REGRAS OBRIGATÓRIAS DE TRANSAÇÃO (SOMA ZERO):
 
 1. ORDEM DE EXECUÇÃO:
-   - As ações de "liberar" sempre serão executadas na Fase 1 (criando o espaço livre '0').
-   - As ações de "realocar" sempre serão executadas na Fase 2 (posicionando apenas sobre espaço vazio ou '0').
+   - As ações de "liberar" sempre serão executadas na Fase 1 (escrevendo a palavra 'vazio').
+   - As ações de "realocar" sempre serão executadas na Fase 2 (posicionando apenas sobre espaço vazio ou 'vazio').
 
-2. REDUÇÃO CIRÚRGICA DO CLIENTE PRINCIPAL '{nome_cliente}' POR BLOCO:
-   - Divida as ações de 'liberar' indicando os blocos exatos e as quantidades exatas de redução (ex: liberar 137 no bloco 'vazio-3' e liberar 133 no bloco 'vazio-6').
-   - O campo 'novo_cliente' na ação 'liberar' deve receber o ID do bloco de origem correspondente (ex: 'vazio-3' ou 'vazio-6').
+2. REDUÇÃO CIRÚRGICA DO CLIENTE PRINCIPAL '{nome_cliente}' POR AMBIENTE:
+   - Divida as ações de 'liberar' indicando os ambientes exatos e as quantidades exatas de redução (ex: liberar no ambiente 'vazio-3-A' ou 'vazio-6-A').
+   - O campo 'novo_cliente' na ação 'liberar' deve receber o ID do ambiente de origem correspondente (ex: 'vazio-3-A' ou 'vazio-6-A').
    - A soma de todas as ações de 'liberar' de '{nome_cliente}' deve totalizar exatamente 270 PAs.
 
 3. PARA OS NOVOS CLIENTES ("Novo A" e "Novo B"):
-   - Gere ações de 'realocar' indicando o bloco de destino correto:
-     - Use o ID do bloco laranjas correspondente (ex: 'vazio-6' ou 'vazio-3').
-     - O campo 'cliente_a_liberar' deve receber o cliente de origem ('1') se estiver usando o espaço reduzido dele naquele bloco.
-     - Nunca misture Novo A e Novo B no mesmo bloco!
+   - Gere ações de 'realocar' indicando o ambiente de destino correto:
+     - Use o ID do ambiente correspondente (ex: 'vazio-6-A' ou 'vazio-3-A').
+     - O campo 'cliente_a_liberar' deve receber o cliente de origem ('1') se estiver usando o espaço reduzido dele naquele ambiente.
+     - Nunca misture Novo A e Novo B no mesmo ambiente!
 
 4. REGRA DE BALANÇO:
-   - Para alocar um cliente em um bloco, certifique-se de que a quantidade de vagas vazias originais daquele bloco somada às vagas que você liberou nele seja MAIOR ou IGUAL à demanda do novo cliente. O script de alocação não faz despejos automáticos.
+   - Para alocar um cliente em um ambiente, certifique-se de que a quantidade de vagas vazias originais daquele ambiente somada às vagas que você liberou nele seja MAIOR ou IGUAL à demanda do novo cliente. O script de alocação não faz despejos automáticos.
 
 5. MATEMÁTICA:
    - Novo A: aloque apenas as 124 PAs operacionais (as salas de reunião devem ser ignoradas fisicamente na planilha).
@@ -126,24 +126,38 @@ RETORNE JSON estrito. Use EXATAMENTE "Novo A" ou "Novo B" nos respectivos campos
 
 @posicionador.output_validator
 def validate_proposta(ctx: RunContext[PlannerDeps], proposta: Proposta) -> Proposta:
-    import re
-    # 1. Extrai a capacidade total real (física) e as vagas vazias de cada bloco laranjas
-    block_sections = re.split(r'--------------------', ctx.deps.blocos_info)
+    from collections import defaultdict
+    
+    # 1. Mapeia capacidades de ambientes, vagas vazias e clientes originais extraídos do blocos_info
     capacidades_totais = {}
     vagas_vazias_originais = {}
+    clientes_originais = {}
     
-    for section in block_sections:
-        match_id = re.search(r'\(vazio-(\d+)\)', section)
-        match_total = re.search(r'Tamanho total do bloco:\s*(\d+)', section)
-        match_empty = re.search(r'Células sem clientes:\s*(\d+)', section)
+    # Varre a string de blocos_info gerada dinamicamente pelo ScannerPremissas
+    env_matches = re.finditer(
+        r"Ambiente\s+([A-K])\s+\((vazio-\d+-[A-K])\):"
+        r".*?Células totais mapeadas fisicamente neste ambiente:\s*(\d+)"
+        r".*?Células sem clientes\s*/\s*em branco:\s*(\d+)"
+        r"(.*?)(?=Ambiente\s+[A-K]|--------------------|━━━━━━━━━━━━━━━━|==|$)",
+        ctx.deps.blocos_info, re.DOTALL | re.IGNORECASE
+    )
+    
+    for m in env_matches:
+        env_id = m.group(2).lower()  # ex: vazio-1-a
+        cap = int(m.group(3))
+        vazias = int(m.group(4))
+        clientes_text = m.group(5)
         
-        if match_id:
-            b_id = f"vazio-{match_id.group(1)}"
-            if match_total:
-                capacidades_totais[b_id] = int(match_total.group(1))
-            if match_empty:
-                vagas_vazias_originais[b_id] = int(match_empty.group(1))
+        capacidades_totais[env_id] = cap
+        vagas_vazias_originais[env_id] = vazias
+        
+        clientes_originais[env_id] = {}
+        for cli_match in re.finditer(r"Cliente\s+'([^']+)':\s*quantidade:\s*(\d+)", clientes_text):
+            cli_name = cli_match.group(1).upper()
+            qty = int(cli_match.group(2))
+            clientes_originais[env_id][cli_name] = qty
             
+    # 2. Validação estrita de nomes de novos clientes
     valid_new_clients = {"NOVO A", "NOVO B"}
     invalid_names = []
     
@@ -159,64 +173,79 @@ def validate_proposta(ctx: RunContext[PlannerDeps], proposta: Proposta) -> Propo
             f"ERRO CRÍTICO DE NOMENCLATURA: Nomes ERRADOS encontrados: {invalid_names}\n"
             f"Devem ser EXATAMENTE: 'Novo A' ou 'Novo B'."
         )
-    
-    # 2. Mapeia as liberações planejadas de cada cliente por bloco de destino
-    liberacoes_por_bloco = {}  # { (cliente, bloco): quantidade }
-    vagas_liberadas_globais = {}  # { cliente: quantidade }
-    
-    for a in proposta.acoes:
-        if a.tipo == 'liberar':
-            cli_key = str(a.cliente_a_liberar or a.cliente).strip().upper()
-            vagas_liberadas_globais[cli_key] = vagas_liberadas_globais.get(cli_key, 0) + a.quantidade
+        
+    # 3. Máquina de estados para calcular a ocupação final de cada ambiente
+    estado_clientes = defaultdict(dict)
+    for env_id, clis in clientes_originais.items():
+        for cli, qty in clis.items():
+            estado_clientes[cli][env_id] = qty
             
-            bloco_origem = a.novo_cliente.strip()
-            if bloco_origem:
-                liberacoes_por_bloco[(cli_key, bloco_origem)] = liberacoes_por_bloco.get((cli_key, bloco_origem), 0) + a.quantidade
+    liberacoes_por_env = {}  # { (cliente, ambiente): quantidade }
     
-    # 3. Validação de Balanço Geográfico por Bloco (Evita over-reduction e transbordo)
-    destinos_por_cliente = {}
-
+    # Processa as liberações primeiro (Fase 1)
+    for acao in proposta.acoes:
+        if acao.tipo == 'liberar':
+            dest = str(acao.novo_cliente).strip().lower()  # ex: vazio-3-a
+            cli_origem = str(acao.cliente_a_liberar or acao.cliente).strip().upper()
+            liberacoes_por_env[(cli_origem, dest)] = liberacoes_por_env.get((cli_origem, dest), 0) + acao.quantidade
+            
+            if dest in estado_clientes[cli_origem]:
+                estado_clientes[cli_origem][dest] -= acao.quantidade
+                if estado_clientes[cli_origem][dest] <= 0:
+                    del estado_clientes[cli_origem][dest]
+            else:
+                raise ModelRetry(
+                    f"ERRO: Tentativa de liberar {acao.quantidade} do Cliente {cli_origem} no ambiente {dest}, "
+                    f"mas esse cliente não existe originalmente neste ambiente."
+                )
+                
+    # Processa as alocações/realocações (Fase 2)
     for acao in proposta.acoes:
         if acao.tipo in ('realocar', 'alocar'):
-            cliente_clean = re.sub(r'-(complemento|parte|excedente|residuo)', '', str(acao.cliente).strip(), flags=re.IGNORECASE).strip()
-            match_novo = re.search(r'novo[-\s]*(?:cliente[-\s]*)?([a-zA-Z0-9]+)', cliente_clean, flags=re.IGNORECASE)
-            cliente_clean = f"Novo {match_novo.group(1).upper()}" if match_novo else cliente_clean[:15]
-            
-            dest = acao.novo_cliente.strip()
-            destinos_por_cliente.setdefault(cliente_clean, set()).add(dest)
-            
+            dest = str(acao.novo_cliente).strip().lower()  # ex: vazio-3-a
+            cli_name = str(acao.cliente).strip().upper()
             total_solicitado = acao.quantidade + acao.sala_lugares
             
-            # Validação física: não pode alocar mais do que o tamanho do bloco suporta
-            if dest in capacidades_totais and total_solicitado > capacidades_totais[dest]:
-                raise ModelRetry(f"ERRO: {total_solicitado} posições excede a capacidade física total de {capacidades_totais[dest]} do bloco {dest}.")
+            if dest not in capacidades_totais:
+                raise ModelRetry(
+                    f"ERRO DE GEOMETRIA: O ambiente '{dest}' indicado como destino não existe na planta."
+                )
+                
+            if total_solicitado > capacidades_totais[dest]:
+                raise ModelRetry(
+                    f"ERRO DE EXCESSO FÍSICO: Alocação de {total_solicitado} PAs excede a capacidade total "
+                    f"de {capacidades_totais[dest]} do ambiente {dest}."
+                )
+                
+            vazio_disponivel = vagas_vazias_originais.get(dest, 0)
+            cli_origem_key = str(acao.cliente_a_liberar or '').strip().upper()
+            liberado_disponivel = liberacoes_por_env.get((cli_origem_key, dest), 0)
             
-            # Validação de Balanço Geográfico: vagas vazias + vagas liberadas planejadas naquele bloco
-            if dest in vagas_vazias_originais:
-                vazio_disponivel = vagas_vazias_originais[dest]
-                
-                cli_origem_key = str(acao.cliente_a_liberar or '').strip().upper()
-                liberado_disponivel = liberacoes_por_bloco.get((cli_origem_key, dest), 0)
-                
-                total_vagas_geograficas = vazio_disponivel + liberado_disponivel
-                
-                if total_solicitado > total_vagas_geograficas:
-                    raise ModelRetry(
-                        f"ERRO DE BALANÇO GEOGRÁFICO: Você está tentando alocar {total_solicitado} PAs do {acao.cliente} no bloco {dest}, "
-                        f"mas o bloco {dest} só possui {vazio_disponivel} vagas vazias originais e você só planejou liberar {liberado_disponivel} PAs do Cliente {cli_origem_key} neste bloco específico. "
-                        f"Isso causará um transbordo de PAs ou um despejo forçado indevido que reduzirá o Cliente {cli_origem_key} além do limite! "
-                        f"Ajuste as ações de 'liberar' e 'realocar' para que as quantidades batam exatamente dentro do mesmo bloco."
-                    )
+            total_vagas_disponiveis = vazio_disponivel + liberado_disponivel
             
-            elif "-liberado" in dest.lower():
-                orig = dest.replace("-liberado", "").replace("-LIBERADO", "").strip().upper()
-                vagas_disponivel = vagas_liberadas_globais.get(orig, 0)
-                if total_solicitado > (vagas_disponivel + 40):
-                    raise ModelRetry(f"ERRO: {total_solicitado} posições excede as {vagas_disponivel} liberadas de {orig}.")
-
-    for c, dests in destinos_por_cliente.items():
-        limite = 3 if c in ('1', '3', '4') else 2
-        if len(dests) > limite:
-            raise ModelRetry(f"ERRO DE FRAGMENTAÇÃO: Limite de {limite} blocos excedido para '{c}'.")
-    
+            if total_solicitado > total_vagas_disponiveis:
+                raise ModelRetry(
+                    f"ERRO DE BALANÇO GEOGRÁFICO: Tentando alocar {total_solicitado} PAs do {acao.cliente} no ambiente {dest}, "
+                    f"mas o ambiente {dest} possui apenas {vazio_disponivel} vagas vazias originais e você liberou {liberado_disponivel} PAs neste ambiente específico. "
+                    f"Isso causará transbordo!"
+                )
+                
+            estado_clientes[cli_name][dest] = estado_clientes[cli_name].get(dest, 0) + acao.quantidade
+            
+    # 4. Validação estrita da regra de não-fragmentação por ambiente
+    for cli, envs in estado_clientes.items():
+        # Exceção explícita prevista na premissa (Agora o 0 é cliente estável e validado no limite de 2)
+        if cli in ('1', '3', '4'):
+            continue
+            
+        # Filtra apenas os ambientes que terminaram com quantidade positiva de PAs deste cliente
+        ambientes_ocupados = [env for env, qty in envs.items() if qty > 0]
+        
+        if len(ambientes_ocupados) > 2:
+            raise ModelRetry(
+                f"ERRO DE FRAGMENTAÇÃO POR AMBIENTE: O Cliente '{cli}' está dividido em {len(ambientes_ocupados)} ambientes "
+                f"({', '.join(ambientes_ocupados)}), violando a premissa de não ficar em mais de 2 ambientes. "
+                f"Os únicos clientes que podem exceder esse limite são: 1, 3 e 4. Consolide as equipes!"
+            )
+            
     return proposta

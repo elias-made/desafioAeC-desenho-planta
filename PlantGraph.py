@@ -43,7 +43,7 @@ def identify_bench_partners(ws, max_scan_rows: int = 200) -> Dict[int, int]:
             if val is not None:
                 v_str = str(val).strip().upper()
                 # Identifica coluna com dados operacionais (não é vazio, sala, etc)
-                if v_str not in ('0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', '', 'CATRACA', 'SALA CLIENTE', 'COWORKING'):
+                if v_str not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', '', 'CATRACA', 'SALA CLIENTE', 'COWORKING'): # '0' removido para ser tratado como operacional ativo
                     pa_cols.add(c)
     
     sorted_cols = sorted(list(pa_cols))
@@ -116,7 +116,7 @@ def build_plant_graph(ws) -> Dict[str, Dict[str, Any]]:
             cell_ref = f"{get_column_letter(c)}{r}"
             
             # Identifica tipo de célula
-            if v_str in ('0', 'VAZIO', ''):
+            if v_str in ('VAZIO', ''): # '0' removido para marcar status 'ocupada'
                 status = 'vazia'
                 cliente = None
             elif v_str in ('SALA', 'SALA CLIENTE', 'Sala'):
@@ -153,7 +153,7 @@ def build_plant_graph(ws) -> Dict[str, Dict[str, Any]]:
 
 # ════════════════════════════════════════════════════════════════════════════
 # Análise e Consultas
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
 
 def get_client_cells(graph: Dict[str, Dict[str, Any]], cliente: str) -> list:
     """Retorna todas as células de um cliente específico."""

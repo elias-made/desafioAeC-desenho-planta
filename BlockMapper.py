@@ -85,8 +85,8 @@ def scan_plant(ws, forbidden_patterns: Set[str]) -> Dict:
         for c in range(1, ws.max_column + 1):
             v = ws.cell(row=r, column=c).value
             if v is None:
-                continue
-            if isinstance(v, float) and v == int(v):
+                v_str = ""
+            elif isinstance(v, float) and v == int(v):
                 v_str = str(int(v))
             else:
                 v_str = str(v).strip()
@@ -94,7 +94,7 @@ def scan_plant(ws, forbidden_patterns: Set[str]) -> Dict:
 
             if any(pat in v_up for pat in forbidden_patterns):
                 forbidden.add((r, c))
-            elif v_str:
+            else:
                 client_cells.setdefault(v_str, set()).add((r, c))
 
     return {'client_cells': client_cells, 'forbidden': forbidden}
@@ -184,7 +184,7 @@ def find_empty_blocks(client_cells: Dict[str, Set[Cell]], ws_max_row: int, ws_ma
                       corridor_gap: int = 3) -> Dict[str, Dict]:
     """Identifica blocos vazios na planilha utilizando o raio de 1 célula de segurança vertical."""
     empty_cells = set()
-    for key in ('VAZIO', 'vazio', '0'):
+    for key in ('VAZIO', 'vazio', ''):  # '0' removido e não é mais detectado como espaço vazio
         empty_cells.update(client_cells.get(key, set()))
         
     if not empty_cells:
@@ -193,10 +193,9 @@ def find_empty_blocks(client_cells: Dict[str, Set[Cell]], ws_max_row: int, ws_ma
     active_cells = set()
     for client, cells in client_cells.items():
         client_up = str(client).upper().strip()
-        if client_up not in ('VAZIO', '0', 'SEM POSSIB', 'CT', 'SA', 'CW', '##', ''):
+        if client_up not in ('VAZIO', 'SEM POSSIB', 'CT', 'SA', 'SA', 'CW', '##', ''):
             active_cells.update(cells)
     
-    # IMPORTANTE: Ajustado o recuo para 1 célula vertical (preserva espaço contíguo útil)
     clean_empty_cells = set()
     for r, c in empty_cells:
         is_fringe = False

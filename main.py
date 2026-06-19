@@ -10,7 +10,7 @@ import openpyxl
 from dotenv import load_dotenv
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
-from ScannerPremissas import scan_orange_context, build_context_string_for_llm
+from ScannerPremissas import scan_orange_context, build_context_string_for_llm, normalize_val
 
 from Agents import PlannerDeps, orquestrador, posicionador
 from BlockMapper import scan_plant, describe_for_llm
@@ -42,7 +42,7 @@ def get_bench_partner(c, ws):
                 val = ws.cell(r, col).value
                 if val is not None:
                     v_str = str(val).strip().upper()
-                    if v_str not in ('0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
+                    if v_str not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
                         pa_cols.add(col)
         
         sorted_cols = sorted(list(pa_cols))
@@ -85,60 +85,95 @@ def build_blocos_info(plant_data, ws_max_row, ws_max_col, ws=None):
     if ws is None:
         return "Nenhum bloco laranja mapeado."
         
-    IGNORED_TAGS = {
-        'CATRACA', 'ESCANINHOS', 'SALA', 'PUXADINHO', 'COWORKING', 
-        'SALA1', 'SALA2', 'SALA3', 'SALA4', 'SALA CLIENTE'
-    }
-        
     macro_blocks = scan_orange_context('planta.xlsx', SHEET_NAME)
-    client_cells = plant_data['client_cells']
     
+    # Pre-cache rápido das células para o relatório
+    all_cells_cache = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            all_cells_cache[(r, c)] = ws.cell(row=r, column=c)
+            
     lines = []
     for idx, block in enumerate(macro_blocks, start=1):
         b_id = f"vazio-{idx}"
         r_min, r_max, c_min, c_max = block['bounding_box']
+        col_min = get_column_letter(c_min)
+        col_max = get_column_letter(c_max)
         
-        lines.append(f"--------------------Bloco {idx} ({b_id})--------------------")
-        lines.append(f"Localização: colunas {get_column_letter(c_min)}-{get_column_letter(c_max)}, linhas {r_min}-{r_max}")
-        
+        lines.append(f"-------------------- Bloco {idx} ({b_id}) --------------------")
+        lines.append(f"Localização Macro: colunas {col_min}-{col_max}, linhas {r_min}-{r_max}")
         if block['texts']:
-            lines.append("📌 Anotações na borda laranjas:")
-            for txt in block['texts']:
-                lines.append(f"  - {txt}")
+            lines.append(f"📌 Anotações na borda: {', '.join(block['texts'])}")
         lines.append("")
         
-        lines.append("Células disponíveis:")
-        
-        clients_in_block = {}
-        empty_count = 0
-        total_cells_in_block = 0
-        
-        for cliente, cells in client_cells.items():
-            cliente_norm = str(cliente).strip()
+        for env in block.get('ambientes', []):
+            env_id = env['id']
+            env_r_min, env_r_max, env_c_min, env_c_max = env['bounding_box']
+            env_col_min = get_column_letter(env_c_min)
+            env_col_max = get_column_letter(env_c_max)
             
-            if cliente_norm.upper() in IGNORED_TAGS:
-                continue
+            client_counts = {}
+            empty_count = 0
+            
+            for (r, c) in env['cells']:
+                cell = all_cells_cache.get((r, c))
+                val = cell.value if cell else None
+                val_str = str(val).strip() if val is not None else ""
                 
-            count = sum(1 for (r, c) in cells if r_min <= r <= r_max and c_min <= c <= c_max)
-            if count > 0:
-                total_cells_in_block += count
-                if cliente_norm.upper() in ('0', 'VAZIO'):
-                    empty_count += count
+                # Se for expressamente escrito 'vazio' ou 'VAZIO' (mesa física desocupada)
+                if val_str.upper() == 'VAZIO':
+                    empty_count += 1
+                elif val_str != "" and val_str.upper() not in ('CT', 'CATRACA', 'SA', 'CW', 'COWORKING', '##'):
+                    norm_val = normalize_val(val)
+                    client_counts[norm_val] = client_counts.get(norm_val, 0) + 1
                     
-                clients_in_block[cliente_norm] = count
-                
-        for cl, qtd in sorted(clients_in_block.items(), key=lambda x: x[0]):
-            if cl.upper() in ('0', 'VAZIO'):
-                lines.append(f"Célula '{cl}': quantidade: {qtd};")
+            lines.append(f"  Ambiente {env_id} ({b_id}-{env_id}):")
+            lines.append(f"    Limites da Bounding Box: colunas {env_col_min}-{env_col_max}, linhas {env_r_min}-{env_r_max}")
+            lines.append(f"    Células totais mapeadas fisicamente neste ambiente: {len(env['cells'])}")
+            lines.append(f"    Células sem clientes / em branco: {empty_count}") # Retorna apenas mesas desocupadas reais
+            lines.append("    Clientes identificados:")
+            if client_counts:
+                for cli, qty in sorted(client_counts.items()):
+                    lines.append(f"      - Cliente '{cli}': quantidade: {qty}")
             else:
-                lines.append(f"Cliente '{cl}': quantidade: {qtd};")
-                
-        lines.append("")
-        lines.append(f"Células totais ocupadas e desocupadas: {total_cells_in_block}")
-        lines.append(f"Células sem clientes: {empty_count};")
+                lines.append("      - Nenhum operador ativo")
+            lines.append("")
+            
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
         
-    return "\n".join(lines)
+    # --- RESUMO TOTAL DOS CLIENTES EM MESAS ---
+    total_counts = {}
+    ignored_on_summary = {'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', '', 'CATRACA', 'ESCANINHOS', 'SALA CLIENTE', 'COWORKING'}
+    
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(row=r, column=c).value
+            if val is not None:
+                val_str = str(int(val) if isinstance(val, float) and val == int(val) else val).strip()
+                val_up = val_str.upper()
+                if val_up not in ignored_on_summary:
+                    total_counts[val_str] = total_counts.get(val_str, 0) + 1
+                    
+    summary_lines = [
+        "============================================================",
+        "RESUMO TOTAL DE CLIENTES EM MESAS (PLANTA INTEIRA):",
+        "============================================================"
+    ]
+    for client, qty in sorted(total_counts.items(), key=lambda x: x[0]):
+        summary_lines.append(f"  Cliente '{client}': quantidade: {qty};")
+    summary_lines.append("============================================================\n")
+        
+    return "\n".join(lines) + "\n" + "\n".join(summary_lines)
+
+def parse_env_id(env_id_str: str) -> Tuple[str, str]:
+    """
+    Decodifica a nomenclatura de ambiente unificada.
+    Ex: 'vazio-3-A' -> ('vazio-3', 'A')
+    """
+    match = re.match(r'^(vazio-\d+)-([A-K])$', env_id_str.strip(), re.IGNORECASE)
+    if match:
+        return match.group(1).lower(), match.group(2).upper()
+    return "", ""
 
 def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int]]) -> tuple:
     from BlockMapper import flood_fill, group_zones
@@ -153,7 +188,6 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
             else:
                 cell_values[(r, c)] = ""
 
-    # 1. Mapeia fontes e preenchimentos originais de todos os clientes ativos da planilha
     client_fills = {}
     client_fonts = {}
     for r in range(1, ws.max_row + 1):
@@ -162,30 +196,28 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
             v = cell.value
             if v is not None:
                 v_str = str(int(v) if isinstance(v, float) and v == int(v) else v).strip().upper()
-                if v_str not in ('0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
+                if v_str not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''):
                     if cell.fill and cell.fill.patternType == 'solid':
                         client_fills[v_str] = copy(cell.fill)
                     if cell.font:
                         client_fonts[v_str] = copy(cell.font)
 
-    # Cores exclusivas para novos clientes que não existem originalmente na planilha
     default_new_fills = {
-        'NOVO A': PatternFill(start_color='34495E', end_color='34495E', fill_type='solid'), # Azul escuro
-        'NOVO B': PatternFill(start_color='9B59B6', end_color='9B59B6', fill_type='solid'), # Roxo Amethyst
+        'NOVO A': PatternFill(start_color='34495E', end_color='34495E', fill_type='solid'),
+        'NOVO B': PatternFill(start_color='9B59B6', end_color='9B59B6', fill_type='solid'),
     }
     default_new_fonts = {
         'NOVO A': Font(color='FFFFFF', bold=True, size=8),
         'NOVO B': Font(color='FFFFFF', bold=True, size=8),
     }
 
-    # Carrega as coordenadas das caixas laranjas dinamicamente
+    # Carrega as estruturas espaciais dinâmicas
     macro_blocks = scan_orange_context('planta.xlsx', SHEET_NAME)
 
     freed_by_client = {}
-    non_client_values = {'0', 'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''}
+    non_client_values = {'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''}
     active_clients_cache = {v.upper() for v in cell_values.values() if v.upper() not in non_client_values}
     
-    # Separa as ações em duas fases: Primeiro libera tudo, depois posiciona sobre os espaços livres
     acoes_liberar = [a for a in proposta.acoes if a.tipo.lower().strip() == 'liberar']
     acoes_realocar = [a for a in proposta.acoes if a.tipo.lower().strip() in ('realocar', 'alocar')]
     
@@ -199,7 +231,7 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
         partner_col = get_bench_partner(c, ws)
         if partner_col:
             partner_val = cell_values.get((r, partner_col), "").strip().upper()
-            if partner_val and partner_val not in ('0', 'VAZIO', '', t_up) and partner_val not in reduced_clients:
+            if partner_val and partner_val not in ('VAZIO', '', t_up) and partner_val not in reduced_clients:
                 if partner_val in active_clients_cache: return False
         
         return current_val in non_client_values or current_val == t_up or current_val in reduced_clients
@@ -213,74 +245,83 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
         if len(alocadas) < qtd: alocadas.extend([c for c in sorted(disp, key=lambda x: (x[1], x[0])) if c not in alocadas][:qtd - len(alocadas)])
         return alocadas
 
-    # === FASE 1: LIBERAR (Sempre executada primeiro para criar as mesas '0') ===
+    # === FASE 1: LIBERAR POR SUB-AMBIENTE ESTREITO ===
     for acao in acoes_liberar:
         alvo = str(acao.cliente_a_liberar or acao.cliente).strip()
         alvo_norm = alvo.upper()
         
-        target_block = acao.novo_cliente.strip()
-        matching_block = next((b for b in macro_blocks if f"vazio-{macro_blocks.index(b)+1}" == target_block), None)
+        target_env = acao.novo_cliente.strip()  # ex: vazio-3-A
+        block_id, env_letter = parse_env_id(target_env)
         
-        if matching_block:
-            r_min, r_max, c_min, c_max = matching_block['bounding_box']
-            cells_to_free = []
-            for r in range(r_min, r_max + 1):
-                for c in range(c_min, c_max + 1):
+        matching_block = None
+        if block_id:
+            match_block_idx = int(re.search(r'\d+', block_id).group())
+            if match_block_idx <= len(macro_blocks):
+                matching_block = macro_blocks[match_block_idx - 1]
+                
+        if matching_block and env_letter:
+            matching_env = next((e for e in matching_block.get('ambientes', []) if e['id'].upper() == env_letter), None)
+            if matching_env:
+                env_cells = matching_env['cells']
+                cells_to_free = []
+                for (r, c) in env_cells:
                     if cell_values.get((r, c), "").upper() == alvo_norm:
                         cells_to_free.append((r, c))
-            target_zone = cells_to_free
+                target_zone = cells_to_free
+            else:
+                target_zone = []
         else:
             cells_to_free = [k for k, v in cell_values.items() if v.upper() == alvo_norm]
             zones = group_zones(flood_fill(set(cells_to_free)), gap=CORRIDOR_GAP)
             target_zone = zones[0] if zones else cells_to_free
             
-        # Alinha a variável de ordenação fora dos blocos condicionais
         cells_to_free_sorted = sorted(target_zone, key=lambda coord: (coord[1], coord[0]))
             
         for r, c in cells_to_free_sorted[:acao.quantidade]:
-            ws.cell(r, c).value, cell_values[(r, c)] = '0', '0'
+            ws.cell(r, c).value, cell_values[(r, c)] = 'vazio', 'vazio'
             ws.cell(r, c).fill, ws.cell(r, c).font = FILL_LIBERADO, FONT_SMALL
             freed_by_client.setdefault(alvo, []).append((r, c))
             log['liberadas'][(r, c)] = alvo
 
-    # === FASE 2: REALOCAR (Apenas posiciona onde já tem espaço livre '0', 'vazio' ou 'VAZIO') ===
+    # === FASE 2: REALOCAR POR SUB-AMBIENTE ESTREITO ===
     for acao in acoes_realocar:
         pool = []
-        target_block = acao.novo_cliente.strip()
+        target_env = acao.novo_cliente.strip() # ex: vazio-3-A
         
-        # DEFINE CLI_CLEAN NO INÍCIO DO LOOP (Corrige o NameError)
         cli_clean = re.sub(r'-(complemento|parte|excedente|residuo)', '', str(acao.cliente), flags=re.IGNORECASE).strip()
         m_novo = re.search(r'novo[-\s]*(?:cliente[-\s]*)?([a-zA-Z0-9]+)', cli_clean, flags=re.IGNORECASE)
         cli_clean = f"Novo {m_novo.group(1).upper()}" if m_novo else cli_clean[:15]
         
-        matching_block = next((b for b in macro_blocks if f"vazio-{macro_blocks.index(b)+1}" == target_block), None)
+        block_id, env_letter = parse_env_id(target_env)
         
-        if matching_block:
-            r_min, r_max, c_min, c_max = matching_block['bounding_box']
-            
-            # Coleta estritamente células que estão desocupadas ('0', 'VAZIO', 'vazio')
-            for r in range(r_min, r_max + 1):
-                for c in range(c_min, c_max + 1):
+        matching_block = None
+        if block_id:
+            match_block_idx = int(re.search(r'\d+', block_id).group())
+            if match_block_idx <= len(macro_blocks):
+                matching_block = macro_blocks[match_block_idx - 1]
+                
+        if matching_block and env_letter:
+            matching_env = next((e for e in matching_block.get('ambientes', []) if e['id'].upper() == env_letter), None)
+            if matching_env:
+                env_cells = matching_env['cells']
+                for (r, c) in env_cells:
                     val = cell_values.get((r, c), "").upper()
-                    if val in ('0', 'VAZIO', '') and is_safe_cell(r, c, cli_clean):
+                    if val in ('VAZIO', '') and is_safe_cell(r, c, cli_clean):
                         pool.append((r, c))
                         
-        elif "liberad" in target_block.lower():
-            client_origem = target_block.replace("-liberado", "").replace("-liberado".upper(), "").strip().upper()
-            matching_key = next((key for key in freed_by_client.keys() if key.upper() == client_origem), None)
-            if matching_key:
-                pool = [(r, c) for r, c in freed_by_client[matching_key] if cell_values.get((r, c), "").upper() in ('0', 'VAZIO') and is_safe_cell(r, c, cli_clean)]
-        
-        dests = fill_bfs(pool, acao.quantidade)
-        
-        if len(dests) < acao.quantidade:
-            geral = [k for k, v in cell_values.items() if v.upper() in ('0', 'VAZIO') and is_safe_cell(k[0], k[1], cli_clean) and k not in dests]
-            dests.extend(fill_bfs(geral, acao.quantidade - len(dests)))
+        # Fallback de segurança se o ambiente específico falhar ou estiver sem espaço mapeável
+        if not pool:
+            geral = [k for k, v in cell_values.items() if v.upper() in ('VAZIO', '') and is_safe_cell(k[0], k[1], cli_clean)]
+            dests = fill_bfs(geral, acao.quantidade)
+        else:
+            dests = fill_bfs(pool, acao.quantidade)
+            if len(dests) < acao.quantidade:
+                geral = [k for k, v in cell_values.items() if v.upper() in ('VAZIO', '') and is_safe_cell(k[0], k[1], cli_clean) and k not in dests]
+                dests.extend(fill_bfs(geral, acao.quantidade - len(dests)))
 
         for dr, dc in dests:
             ws.cell(dr, dc).value, cell_values[(dr, dc)] = cli_clean, cli_clean
             
-            # Recupera de forma 100% dinâmica a cor de fundo e a fonte originais mapeadas do cliente
             fill_to_apply = client_fills.get(cli_clean.upper()) or default_new_fills.get(cli_clean.upper(), FILL_NEW_CLIENT)
             font_to_apply = FONT_WHITE if cli_clean.upper() in ['NOVO A', 'NOVO B'] else copy(ws.cell(dr, dc).font)
             
@@ -289,7 +330,7 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
                 ws.cell(dr, dc).font = font_to_apply
                 
             active_clients_cache.add(cli_clean.upper())
-            log['realocadas'].setdefault(f"{cli_clean} → {target_block}", []).append((dr, dc))
+            log['realocadas'].setdefault(f"{cli_clean} → {target_env}", []).append((dr, dc))
 
     return log, cell_values
 
@@ -361,9 +402,19 @@ async def main():
     cliente_a_reduzir = estrategia.output.nome_exato_cliente_principal
     print(f"\n🔍 ALVO DE REDUÇÃO CORRETO IDENTIFICADO PELA IA: '{cliente_a_reduzir}'")
     
-    allowed_cells = set(plant_data['client_cells'].get(cliente_a_reduzir, []))
-    for k in ('VAZIO', 'vazio', '0'):
-        allowed_cells.update(plant_data['client_cells'].get(k, []))
+    # ── PROTEÇÃO CONTRA USO DE CORREDORES ─────────────────────────────────────────
+    # Coleta estritamente PAs (mesas físicas) existentes na planta original.
+    # Células vazias de corredores/hallways (que são None ou "") nunca entram aqui.
+    allowed_cells = set()
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=c)
+            v = cell.value
+            if v is not None:
+                v_str = str(v).strip()
+                if v_str != "" and v_str.upper() not in ('CT', 'CATRACA', 'SA', 'CW', 'COWORKING', '##'):
+                    allowed_cells.add((r, c))
+    # ─────────────────────────────────────────────────────────────────────────────
         
     print("2. Posicionador gerando Ações...")
     prompt_pos = "Gere a proposta detalhada."
@@ -388,7 +439,7 @@ async def main():
     
     new_wb.save(dest_file)
     
-    # --- NOVO: RECALCULA O ESTADO FINAL DOS BLOCOS ---
+    # --- RECALCULA O ESTADO FINAL DOS BLOCOS ---
     final_plant_data = scan_plant(new_ws, FORBIDDEN_PATTERNS)
     final_blocos_info = build_blocos_info(final_plant_data, new_ws.max_row, new_ws.max_column, new_ws)
     
@@ -398,14 +449,10 @@ async def main():
     print("================================================================================")
     print(final_blocos_info)
     
-    # Salva as auditorias originais dos agentes
-    salvar_auditoria("1_orquestrador", formatar_input_deps(deps, "Defina a estratégia macro."), estrategia.output.model_dump_json(indent=2), safe)
-    salvar_auditoria("2_posicionador", formatar_input_deps(deps, prompt_pos), proposta.output.model_dump_json(indent=2), safe)
-    
     # Grava o relatório de mudanças principal
     write_report(ws, new_ws, proposta.output, log, f"propostas/proposta_{safe}_mudancas.txt")
     
-    # --- NOVO: GRAVA O MAPA FINAL DE BLOCOS EM UM ARQUIVO .TXT INDEPENDENTE ---
+    # --- GRAVA O MAPA FINAL DE BLOCOS EM UM ARQUIVO .TXT INDEPENDENTE ---
     caminho_relatorio_final = f"propostas/proposta_{safe}_blocos_finais.txt"
     with open(caminho_relatorio_final, "w", encoding="utf-8") as f:
         f.write("================================================================================\n")
