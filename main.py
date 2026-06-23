@@ -489,9 +489,69 @@ def salvar_auditoria(nome_agente: str, input_data: str, output_data: str, safe_n
     with open(f"{dir_auditoria}/{nome_agente}_output.txt", "w", encoding="utf-8") as f:
         f.write(output_data)
 
-def validar_inventario(ws_orig, ws_new, allowed_cells) -> List[str]:
+def parse_premissas_dinamicas(premissas_txt: str) -> dict:
     """
-    Garante a integridade do banco de dados (Excel) antes de gravar fisicamente.
+    Analisa as premissas em texto e extrai dinamicamente os alvos matemáticos (Regex).
+    """
+    parametros = {
+        "reducoes": {},       # cliente -> qtd a reduzir
+        "novos_clientes": []   # lista de dicts {"nome": ..., "PAs": ...}
+    }
+    
+    # 1. Busca reduções (ex: "Eliminar 270 posições cliente 1")
+    for match in re.finditer(r'(?:eliminar|remover|reduzir)\s+(\d+)\s+posiç\w*\s+cliente\s+(\w+)', premissas_txt, re.IGNORECASE):
+        qtd = int(match.group(1))
+        cliente = normalize_val(match.group(2).strip())
+        parametros["reducoes"][cliente] = qtd
+        
+    # 2. Busca criação de novos espaços (ex: "Criar um novo espaço apartado com 124 PAs")
+    idx_novo = 0
+    for match in re.finditer(r'(?:criar\s+um\s+novo\s+espaço|novo\s+espaço)\s+apartado\s+com\s+(\d+)\s+pas', premissas_txt, re.IGNORECASE):
+        qtd = int(match.group(1))
+        nome_cli = f"NOVO_{chr(65 + idx_novo)}" if idx_novo < 26 else f"NOVO_{idx_novo}"
+        parametros["novos_clientes"].append({"nome": nome_cli, "PAs": qtd})
+        idx_novo += 1
+        
+    return parametros
+
+def normalizar_nome_cliente_novo(nome: str, novos_clientes: List[dict]) -> str:
+    """
+    Normaliza variações de nomes de novos clientes (ex: 'NOVO_ESPACO_A' -> 'NOVO_A')
+    fazendo correspondência por sufixo de letra (A, B, C...) ou ordem.
+    """
+    nome_up = nome.upper().strip()
+    if not nome_up.startswith("NOVO"):
+        return nome
+        
+    # Extrai a letra do sufixo (ex: 'NOVO_ESPACO_A' -> 'A', 'NOVO_CLIENTE_B' -> 'B')
+    match_letra = re.search(r'\b([A-Z])\b|[-_\s]([A-Z])$', nome_up)
+    letra = None
+    if match_letra:
+        letra = match_letra.group(1) or match_letra.group(2)
+        
+    if letra:
+        # Retorna o nome mapeado esperado para aquela letra (ex: 'NOVO_A' para 'A')
+        for nc in novos_clientes:
+            if nc["nome"].endswith(f"_{letra}"):
+                return nc["nome"]
+                
+    return nome
+
+def normalizar_acoes(acoes: List[Acao], novos_clientes: List[dict]) -> List[Acao]:
+    for acao in acoes:
+        # 1. Normaliza campo 'cliente' (usado em liberar e realocar)
+        if acao.cliente:
+            acao.cliente = normalizar_nome_cliente_novo(acao.cliente, novos_clientes)
+        # 2. Normaliza campos 'cliente_a' e 'cliente_b' (usados em transferir)
+        if acao.cliente_a:
+            acao.cliente_a = normalizar_nome_cliente_novo(acao.cliente_a, novos_clientes)
+        if acao.cliente_b:
+            acao.cliente_b = normalizar_nome_cliente_novo(acao.cliente_b, novos_clientes)
+    return acoes
+
+def validar_inventario(ws_orig, ws_new, allowed_cells, parametros: dict) -> List[str]:
+    """
+    Garante a integridade do Excel antes de gravar fisicamente comparando dados dinâmicos.
     """
     def obter_contagem(ws):
         counts = {}
@@ -511,28 +571,31 @@ def validar_inventario(ws_orig, ws_new, allowed_cells) -> List[str]:
     new_counts = obter_contagem(ws_new)
     erros = []
 
-    # 1. Valida preservação exata de todos os clientes estáveis
+    # Identifica dinamicamente quem são os clientes que sofrem alteração deliberada
+    clientes_excluidos_da_preservacao = set(parametros["reducoes"].keys()) | {nc["nome"] for nc in parametros["novos_clientes"]}
+
+    # 1. Valida preservação exata de todos os clientes estáveis (que não foram alterados nas premissas)
     for client, qty in orig_counts.items():
-        if client == '1': 
-            continue  # Cliente 1 tem regra de redução específica
+        if client in clientes_excluidos_da_preservacao: 
+            continue
         qty_new = new_counts.get(client, 0)
         if qty_new != qty:
             erros.append(f"Inconsistência no Cliente estável '{client}': quantidade inicial era {qty}, mas agora é {qty_new} (Perda/Ganho de {qty_new - qty} PAs).")
 
-    # 2. Valida regras dos novos clientes
-    qty_novo_a = new_counts.get('NOVO_A', 0)
-    if qty_novo_a != 124:
-        erros.append(f"Inconsistência no 'NOVO_A': quantidade exigida é 124 PAs, mas atualmente há {qty_novo_a}.")
+    # 2. Valida alocação exata de cada novo cliente de forma dinâmica
+    for nc in parametros["novos_clientes"]:
+        nome = nc["nome"]
+        esperado = nc["PAs"]
+        atual = new_counts.get(nome, 0)
+        if atual != esperado:
+            erros.append(f"Inconsistência no '{nome}': quantidade exigida é {esperado} PAs, mas atualmente há {atual}.")
 
-    qty_novo_b = new_counts.get('NOVO_B', 0)
-    if qty_novo_b != 165:
-        erros.append(f"Inconsistência no 'NOVO_B': quantidade exigida é 165 PAs, mas atualmente há {qty_novo_b}.")
-
-    # 3. Valida redução exata do Cliente 1
-    qty_orig_1 = orig_counts.get('1', 0)
-    qty_new_1 = new_counts.get('1', 0)
-    if qty_orig_1 - qty_new_1 != 270:
-        erros.append(f"Redução inválida do Cliente '1': deveria eliminar exatamente 270 PAs (restante esperado: {qty_orig_1 - 270}), mas restaram {qty_new_1} (redução real de {qty_orig_1 - qty_new_1} PAs).")
+    # 3. Valida redução exata do Cliente modificado de forma dinâmica
+    for cli, reducao in parametros["reducoes"].items():
+        qty_orig = orig_counts.get(cli, 0)
+        qty_new = new_counts.get(cli, 0)
+        if qty_orig - qty_new != reducao:
+            erros.append(f"Redução inválida do Cliente '{cli}': deveria eliminar exatamente {reducao} PAs (restante esperado: {qty_orig - reducao}), mas restaram {qty_new} (redução real de {qty_orig - qty_new} PAs).")
 
     return erros
 
@@ -544,10 +607,32 @@ async def main():
     with open('premissas.txt', encoding='utf-8') as f: 
         premissas_txt = f.read().strip()
 
+    # Extrai dinamicamente os alvos numéricos e nomes de clientes do arquivo TXT
+    parametros_premissas = parse_premissas_dinamicas(premissas_txt)
+
+    # Constrói a lista explícita de nomes que a LLM DEVE usar para os novos clientes
+    lista_novos_nomes = ""
+    if parametros_premissas["novos_clientes"]:
+        lista_novos_nomes = "\n".join(
+            f"  - Para a nova operação de {nc['PAs']} PAs, use RIGOROSAMENTE o nome: '{nc['nome']}'"
+            for nc in parametros_premissas["novos_clientes"]
+        )
+
+    regras_nomes_sistema = ""
+    if lista_novos_nomes:
+        regras_nomes_sistema = (
+            f"\n=== DIRETRIZES DE NOMENCLATURA SISTÊMICA (OBRIGATÓRIO) ===\n"
+            f"Ao criar ou movimentar os novos clientes, você DEVE usar EXATAMENTE estes nomes:\n"
+            f"{lista_novos_nomes}\n"
+            f"NÃO invente outros nomes como 'NOVO_CLIENTE_A' ou 'NOVO_CLIENTE_B'. Use apenas as strings exatas fornecidas acima.\n"
+        )
+
     # Extrai o contexto visual das bordas laranjas e junta com as premissas do arquivo
     dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME)
     premissas_visuais = build_context_string_for_llm(dados_laranjas)
-    premissas_completas = f"{premissas_txt}\n\n{premissas_visuais}"
+    
+    # Consolida as premissas injetando as diretrizes de nomes que a IA deve respeitar
+    premissas_completas = f"{premissas_txt}\n{regras_nomes_sistema}\n{premissas_visuais}"
 
     # Carrega a planta original e escaneia os dados iniciais
     wb, ws = load_plant()
@@ -578,7 +663,6 @@ async def main():
                 if v_str != "" and v_str.upper() not in ('CT', 'CATRACA', 'SA', 'CW', 'COWORKING', '##'):
                     allowed_cells.add((r, c))
     # ─────────────────────────────────────────────────────────────────────────────
-    # ─────────────────────────────────────────────────────────────────────────────
         
     # ══════════════════════════════════════════════════════════════════════════
     # ETAPA 1: Execução do Posicionador (Alocação Bruto Direto)
@@ -592,9 +676,12 @@ async def main():
     res_posicionador = await posicionador.run("Gere a proposta de alocação inicial baseada nas premissas de negócio.", deps=pos_deps)
     rascunho_layout_json = clean_json_string(res_posicionador.output)
     
-    pos_data = json.loads(rascunho_layout_json)
-    safe = re.sub(r'[^a-zA-Z0-9_]', '', pos_data.get("nome", "Reorganizacao").replace(' ', '_'))[:40].lower()
-    dest_file = f"propostas/proposta_{safe}.xlsx"
+    # strict=False desativa erro ao encontrar quebras de linha reais nas strings da IA
+    pos_data = json.loads(rascunho_layout_json, strict=False)
+    
+    # Configuração estrita de salvamento sem variação de nomes (proposta_final.xlsx)
+    dest_file = "propostas/proposta_final.xlsx"
+    safe_name = "final"
     
     os.makedirs('propostas', exist_ok=True)
     shutil.copy("planta.xlsx", dest_file)
@@ -606,6 +693,9 @@ async def main():
     acoes_totais = []
     for ac in pos_data.get("acoes_primarias", []):
         acoes_totais.append(Acao(**ac))
+        
+    # Normaliza as ações primárias antes de executar fisicamente
+    acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
         
     proposta_inicial = PropostaMock(
         nome=pos_data.get("nome", "Alocacao Bruta"),
@@ -622,10 +712,10 @@ async def main():
         f"[BLOCOS INFO]\n{pos_deps.blocos_info}\n\n"
         f"[PLANT INFO]\n{pos_deps.plant_info}"
     )
-    salvar_auditoria("1_posicionador", pos_input_str, res_posicionador.output, safe)
+    salvar_auditoria("1_posicionador", pos_input_str, res_posicionador.output, safe_name)
 
-    # Executa validação de integridade física no estado resultante
-    erros_validacao = validar_inventario(ws, new_ws, allowed_cells)
+    # Executa validação de integridade física no estado resultante com parâmetros dinâmicos
+    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_premissas)
     
     if not erros_validacao:
         print("✓ Inicial layout validado e gravado com sucesso!")
@@ -681,9 +771,10 @@ async def main():
             f"[BLOCOS INFO ATUALIZADOS NA PLANILHA FISICA]\n{org_deps.blocos_info}\n\n"
             f"[PLANT INFO ATUALIZADA]\n{org_deps.plant_info}"
         )
-        salvar_auditoria(f"2_organizador_iter{iteracao}", org_input_str, res_organizador.output, safe)
+        salvar_auditoria(f"2_organizador_iter{iteracao}", org_input_str, res_organizador.output, safe_name)
         
-        org_data = json.loads(reorganizacao_json)
+        # strict=False desativa erro ao encontrar quebras de linha reais nas strings da IA
+        org_data = json.loads(reorganizacao_json, strict=False)
         acoes_org = org_data.get("acoes_organizacao", [])
         
         if not acoes_org and not erros_validacao:
@@ -697,14 +788,17 @@ async def main():
         for ac in acoes_org:
             acoes_iteracao.append(Acao(**ac))
             
+        # Normaliza as ações do organizador antes de executar fisicamente
+        acoes_iteracao = normalizar_acoes(acoes_iteracao, parametros_premissas["novos_clientes"])
+            
         proposta_correcao = PropostaMock(f"Swaps Iteracao {iteracao}", "Baixo", acoes_iteracao)
         
         # Executa em sandbox temporário (clone do estado atual gravado em disco)
         sandbox_wb, sandbox_ws = clone_ws(new_ws)
         log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells)
         
-        # Roda validação matemática no sandbox pós-correção
-        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells)
+        # Roda validação matemática dinâmica no sandbox pós-correção
+        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_premissas)
         
         if not erros_validacao_temp:
             # Commit: Se o sandbox passou nas regras de integridade, aplica as alterações na planilha master física
@@ -754,9 +848,9 @@ async def main():
         acoes=acoes_totais
     )
     
-    write_report(ws, new_ws, proposta_final, log_acumulado, f"propostas/proposta_{safe}_mudancas.txt")
+    write_report(ws, new_ws, proposta_final, log_acumulado, "propostas/proposta_final_mudancas.txt")
     
-    caminho_relatorio_final = f"propostas/proposta_{safe}_blocos_finais.txt"
+    caminho_relatorio_final = "propostas/proposta_final_blocos_finais.txt"
     with open(caminho_relatorio_final, "w", encoding="utf-8") as f:
         f.write("================================================================================\n")
         f.write("RELATÓRIO DO ESTADO FINAL DOS BLOCOS APÓS AS MOVIMENTAÇÕES\n")
@@ -764,9 +858,9 @@ async def main():
         f.write(final_blocos_info)
         
     print(f"✓ Processo concluído com sucesso. Arquivos gravados em 'propostas/':")
-    print(f"  - Excel modificado: proposta_{safe}.xlsx")
-    print(f"  - Lista de mudanças: proposta_{safe}_mudancas.txt")
-    print(f"  - Mapa final de blocos: proposta_{safe}_blocos_finais.txt")
+    print(f"  - Excel modificado: proposta_final.xlsx")
+    print(f"  - Lista de mudanças: proposta_final_mudancas.txt")
+    print(f"  - Mapa final de blocos: proposta_final_blocos_finais.txt")
 
 if __name__ == '__main__':
     asyncio.run(main())
