@@ -11,7 +11,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-from ScannerPremissas import scan_orange_context, build_context_string_for_llm, normalize_val
+from ScannerPremissas import scan_orange_context, normalize_val
 from BlockMapper import scan_plant, flood_fill
 
 # Configurações de planilha e constantes globais
@@ -178,6 +178,10 @@ def build_blocos_info(plant_data, ws_max_row, ws_max_col, ws=None):
         
         for env in block.get('ambientes', []):
             env_id = env['id']
+            env_r_min, env_r_max, env_c_min, env_c_max = env['bounding_box']
+            env_col_min = get_column_letter(env_c_min)
+            env_col_max = get_column_letter(env_c_max)
+            
             client_counts = {}
             empty_count = 0
             
@@ -196,9 +200,16 @@ def build_blocos_info(plant_data, ws_max_row, ws_max_col, ws=None):
                     
             total_mesas = len([coord for coord in env['cells'] if coord in allowed_cells])
             lines.append(f"  - Amb {env_id} ({b_id}-{env_id}): {empty_count} Livres / {total_mesas} Total PAs")
+            
             if client_counts:
                 cl_str = ", ".join(f"'{cli}': {qty}" for cli, qty in sorted(client_counts.items()))
                 lines.append(f"    Equipes: {cl_str}")
+                
+            # INJEÇÃO DINÂMICA DE ANOTAÇÕES NO SUB-AMBIENTE CORRETO:
+            if env.get('texts'):
+                anotacoes_filtradas = [txt for txt in env['texts'] if txt.upper() not in ('VAZIO', '')]
+                if anotacoes_filtradas:
+                    lines.append(f"    Recursos/Anotações nesta sala: {', '.join(anotacoes_filtradas)}")
         lines.append("")
         
     summary_lines = [
@@ -342,16 +353,62 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
             if m_env:
                 env_letter = m_env.group(1).strip()
         
-        env_cells = get_env_cells(block_id, env_letter)
-        if env_cells:
-            cells_to_free = [coord for coord in env_cells if cell_values.get(coord, "").upper() == alvo_norm]
-        else:
-            cells_to_free = [k for k, v in cell_values.items() if v.upper() == alvo_norm]
+        # ── LIBERAÇÃO AUTOMÁTICA GLOBAL ──
+        if not block_id or not env_letter or block_id.lower() == "automatico":
+            # Heurística inteligente: libera posições do cliente alvo priorizando os ambientes 
+            # que já possuem mais vagas vazias para concentrar o espaço livre e maximizar contiguidade.
+            env_vazios = []
+            for b_idx, block in enumerate(macro_blocks, start=1):
+                for env in block.get('ambientes', []):
+                    vazios = sum(1 for coord in env['cells'] if cell_values.get(coord, "").upper() in ('VAZIO', '') and coord in allowed_cells)
+                    env_vazios.append({
+                        'block_idx': b_idx,
+                        'env_id': env['id'],
+                        'vazios': vazios,
+                        'cells': env['cells']
+                    })
             
-        cells_to_free_sorted = sorted(cells_to_free, key=lambda coord: (coord[1], coord[0]))
+            # Ordena decrescente por vagas vazias já existentes
+            env_vazios.sort(key=lambda x: x['vazios'], reverse=True)
+            
+            cells_to_free = []
+            for item in env_vazios:
+                # Coleta as células do cliente alvo naquele sub-ambiente
+                target_cells_in_env = [coord for coord in item['cells'] if cell_values.get(coord, "").upper() == alvo_norm and coord in allowed_cells]
+                target_cells_in_env.sort(key=lambda x: (x[1], x[0]))
+                
+                cells_to_free.extend(target_cells_in_env)
+                if len(cells_to_free) >= acao.quantidade:
+                    break
+                    
+            cells_to_free = cells_to_free[:acao.quantidade]
+            
+            # Nomeia as localizações de forma reversa para o relatório
+            block_id = "automatico"
+            env_letter = "automatico"
+            if cells_to_free:
+                primeira_celula = cells_to_free[0]
+                found = False
+                for b_idx, block in enumerate(macro_blocks, start=1):
+                    for env in block.get('ambientes', []):
+                        if primeira_celula in env['cells']:
+                            block_id = f"vazio-{b_idx}"
+                            env_letter = env['id']
+                            found = True
+                            break
+                    if found: break
         
+        # ── LIBERAÇÃO EM AMBIENTE ESPECÍFICO ──
+        else:
+            env_cells = get_env_cells(block_id, env_letter)
+            if env_cells:
+                cells_to_free = [coord for coord in env_cells if cell_values.get(coord, "").upper() == alvo_norm]
+            else:
+                cells_to_free = [k for k, v in cell_values.items() if v.upper() == alvo_norm]
+            cells_to_free = sorted(cells_to_free, key=lambda coord: (coord[1], coord[0]))[:acao.quantidade]
+            
         liberadas_count = 0
-        for r, c in cells_to_free_sorted[:acao.quantidade]:
+        for r, c in cells_to_free:
             ws.cell(r, c).value, cell_values[(r, c)] = 'vazio', 'vazio'
             ws.cell(r, c).fill, ws.cell(r, c).font = FILL_LIBERADO, FONT_SMALL
             log['liberadas'][(r, c)] = alvo

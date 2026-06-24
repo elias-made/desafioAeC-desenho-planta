@@ -17,7 +17,7 @@ from LayoutEngine import (
 
 # Importando dependências e agentes do Agents.py (Fluxo de 2 Agentes)
 from Agents import PosicionadorDeps, OrganizadorDeps, posicionador, organizador
-from ScannerPremissas import scan_orange_context, build_context_string_for_llm, normalize_val
+from ScannerPremissas import scan_orange_context, normalize_val
 from BlockMapper import scan_plant
 
 load_dotenv()
@@ -41,12 +41,11 @@ async def main():
         "E assim por diante. Use sempre letras maiúsculas e mantenha a consistência nominal.\n"
     )
 
-    # Extrai o contexto visual das bordas laranjas e junta com as premissas do arquivo
+    # Extrai o contexto visual das bordas laranjas (necessário para o mapeamento de células permitidas)
     dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME)
-    premissas_visuais = build_context_string_for_llm(dados_laranjas)
     
-    # Consolida as diretrizes do sistema com o texto de entrada
-    premissas_completas = f"{premissas_txt}\n{regras_nomes_sistema}\n{premissas_visuais}"
+    # Consolida as diretrizes do sistema com o texto de entrada (agora as anotações visuais vão direto no bloco!)
+    premissas_completas = f"{premissas_txt}\n{regras_nomes_sistema}"
 
     # Carrega a planta original e escaneia os dados iniciais
     wb, ws = load_plant()

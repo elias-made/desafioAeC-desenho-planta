@@ -6,4 +6,3 @@ Não utilizar as salas 1,2,3,4 e coworking
 Os clientes não devem ficar divididos em mais de 2 ambientes com exceção dos clientes 1, 3,4.
 Evitar movimentaçoes descenessarias devido aos custos de obras ( focar em eficiencia com menor numero de obras)
 1 catraca a cada 250 PAS
-O cliente 7 deve estar em um ambiente separado

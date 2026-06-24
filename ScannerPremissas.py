@@ -234,7 +234,46 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         
     macro_blocks = []
     valid_groups = [coords for coords in groups.values() if len(coords) >= 10]
-    valid_groups.sort(key=lambda coords: min(r for r, c in coords))
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # ORDENAÇÃO ROBUSTA: TOP-TO-BOTTOM (LINHAS) E LEFT-TO-RIGHT (COLUNAS)
+    # ══════════════════════════════════════════════════════════════════════════
+    # 1. Pré-calcula os limites mínimos de linha e coluna para cada bloco
+    valid_groups_meta = []
+    for coords in valid_groups:
+        min_r = min(r for r, c in coords)
+        min_c = min(c for r, c in coords)
+        valid_groups_meta.append((min_r, min_c, coords))
+        
+    # 2. Ordena preliminarmente de cima para baixo (pela linha inicial)
+    valid_groups_meta.sort(key=lambda x: x[0])
+    
+    # 3. Agrupa os blocos em "bandas horizontais" virtuais usando uma tolerância vertical (ex: 15 linhas)
+    # Isso evita que pequenos desalinhamentos de desenho (ex: linha 5 vs linha 6) quebrem a ordem horizontal
+    bands = []
+    current_band = []
+    row_tolerance = 15
+    
+    for item in valid_groups_meta:
+        if not current_band:
+            current_band.append(item)
+        else:
+            # Se o bloco atual começa muito próximo do primeiro bloco desta banda, agrupamos na mesma linha de leitura
+            if item[0] - current_band[0][0] <= row_tolerance:
+                current_band.append(item)
+            else:
+                bands.append(current_band)
+                current_band = [item]
+    if current_band:
+        bands.append(current_band)
+        
+    # 4. Ordena cada banda interna da esquerda para a direita (por coluna) e reconstrói a lista de grupos
+    valid_groups = []
+    for band in bands:
+        band.sort(key=lambda x: x[1])
+        for item in band:
+            valid_groups.append(item[2])
+    # ══════════════════════════════════════════════════════════════════════════
     
     idx_counter = 1
     for coords in valid_groups:
