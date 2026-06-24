@@ -1,6 +1,11 @@
+# ScannerPremissas.py
+
 import openpyxl
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Set
+
+# Variável global de cache para evitar múltiplas leituras físicas do Excel
+_orange_context_cache = None
 
 def manhattan_distance(c1: Tuple[int, int], c2: Tuple[int, int]) -> int:
     return abs(c1[0] - c2[0]) + abs(c1[1] - c2[1])
@@ -21,40 +26,28 @@ def normalize_val(v) -> str:
         return val_str.upper()
 
 def is_text_annotation(val) -> bool:
-    """
-    Identifica se o valor da célula é uma anotação textual descritiva (palavra).
-    Ignora valores vazios, números de campanha e estados operacionais de uma única letra.
-    """
     if val is None:
         return False
     val_str = str(val).strip()
     if not val_str:
         return False
-    
-    # Ignora números de campanha (ex: '2.0', '5', '10.0', '0')
     try:
         float(val_str)
         return False
     except ValueError:
         pass
-        
-    # Ignora marcações de estado comuns de uma única letra e caracteres especiais
     if val_str.upper() in ('I', 'Q', 'T', "T'", '##'):
         return False
-        
     return True
 
 def is_color_orange_robust(color) -> bool:
     if not color:
         return False
-        
     if color.rgb and color.rgb != '00000000':
         rgb_str = str(color.rgb).strip().upper()
         clean_rgb = rgb_str[-6:]
-        
         if clean_rgb in ('FF9900', 'FFC000', 'ED7D31', 'F79646', 'FFB347', 'FF8C00', 'E26B0A', 'F2994A', 'FF9F43', 'FF9933', 'FFCC00'):
             return True
-            
         try:
             r = int(clean_rgb[0:2], 16)
             g = int(clean_rgb[2:4], 16)
@@ -63,37 +56,28 @@ def is_color_orange_robust(color) -> bool:
                 return True
         except:
             pass
-            
     if color.type == 'theme' and color.theme is not None:
         if color.theme == 5:
             return True
-            
     return False
 
 def is_barrier_color(color) -> bool:
-    """Verifica se uma cor representa uma divisória física (focado estritamente em laranjas)."""
     if not color:
         return False
     return is_color_orange_robust(color)
 
 def has_blocking_border_between(all_cells_cache: Dict[Tuple[int, int], any], r1: int, c1: int, r2: int, c2: int, direction: str) -> bool:
-    """
-    Verifica se existe uma borda laranja de bloqueio entre duas células adjacentes utilizando o cache em memória.
-    """
     if direction == 'horizontal':
         c_left = min(c1, c2)
         c_right = max(c1, c2)
         cell_left = all_cells_cache.get((r1, c_left))
         cell_right = all_cells_cache.get((r1, c_right))
-        
         if not cell_left or not cell_right:
             return False
-        
         b_left = cell_left.border
         if b_left and b_left.right and b_left.right.border_style and b_left.right.border_style != 'none':
             if is_barrier_color(b_left.right.color):
                 return True
-                
         b_right = cell_right.border
         if b_right and b_right.left and b_right.left.border_style and b_right.left.border_style != 'none':
             if is_barrier_color(b_right.left.color):
@@ -103,20 +87,16 @@ def has_blocking_border_between(all_cells_cache: Dict[Tuple[int, int], any], r1:
         r_bottom = max(r1, r2)
         cell_top = all_cells_cache.get((r_top, c1))
         cell_bottom = all_cells_cache.get((r_bottom, c1))
-        
         if not cell_top or not cell_bottom:
             return False
-        
         b_top = cell_top.border
         if b_top and b_top.bottom and b_top.bottom.border_style and b_top.bottom.border_style != 'none':
             if is_barrier_color(b_top.bottom.color):
                 return True
-                
         b_bottom = cell_bottom.border
         if b_bottom and b_bottom.top and b_bottom.top.border_style and b_bottom.top.border_style != 'none':
             if is_barrier_color(b_bottom.top.color):
                 return True
-                
     return False
 
 def cell_has_orange_fill(cell) -> bool:
@@ -143,13 +123,11 @@ def is_desk_cell(cell) -> bool:
         return False
     val_str = str(cell.value).strip()
     val_upper = val_str.upper()
-    
     try:
         float(val_upper)
         return True
     except ValueError:
         pass
-        
     if val_upper in ('VAZIO', 'T', "T'", 'ADM', 'I', 'Q'):
         return True
     return False
@@ -159,37 +137,30 @@ def is_barrier_cell(cell) -> bool:
         return False
     if is_desk_cell(cell):
         return False
-        
     val_str = str(cell.value).strip() if cell.value is not None else ""
     val_upper = val_str.upper()
-        
     if val_upper in ('##', 'SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS'):
         return True
-        
     fill = cell.fill
     if fill and fill.patternType == 'solid' and fill.start_color:
         rgb_str = str(fill.start_color.rgb).upper()
         if rgb_str[-6:] in ('000000', '1A1A1A', '2C3E50'):
             return True
-            
     return False
 
 def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col: int) -> Set[Tuple[int, int]]:
     visited = set()
     queue = deque()
-    
     for r in (1, max_row):
         for c in range(1, max_col + 1):
             if (r, c) not in border_cells:
                 queue.append((r, c))
                 visited.add((r, c))
-                
     for c in (1, max_col):
         for r in range(1, max_row + 1):
             if (r, c) not in border_cells and (r, c) not in visited:
                 queue.append((r, c))
                 visited.add((r, c))
-                
     while queue:
         r, c = queue.popleft()
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -198,33 +169,32 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
                 if (nr, nc) not in border_cells and (nr, nc) not in visited:
                     visited.add((nr, nc))
                     queue.append((nr, nc))
-                    
     interior = set()
     for r in range(1, max_row + 1):
         for c in range(1, max_col + 1):
             coord = (r, c)
             if coord not in border_cells and coord not in visited:
                 interior.add(coord)
-                
     return interior
 
 def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
+    global _orange_context_cache
+    # Retorna o contexto estruturado em cache se já foi lido uma vez
+    if _orange_context_cache is not None:
+        return _orange_context_cache
+
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb[sheet_name]
-    
     orange_cells = set()
     cell_values = {}
     all_cells_cache = {}
     
-    # 1. PASSO ÚNICO DE CACHE: Lê todas as células da planilha e guarda em um dicionário rápido
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
             cell = ws.cell(row=r, column=c)
             all_cells_cache[(r, c)] = cell
-            
             if cell_has_orange_border_or_fill(cell):
                 orange_cells.add((r, c))
-                    
             if cell.value is not None:
                 val_str = str(cell.value).strip()
                 if val_str and len(val_str) > 3 and val_str.upper() not in ('VAZIO', 'SALA', 'CATRACA', 'COWORKING'):
@@ -249,7 +219,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         if root_i != root_j:
             parent[root_i] = root_j
             
-    # Otimização O(N) Spatial Lookup: Agrupa células laranjas sem comparar todas contra todas
     coord_to_idx = {coord: idx for idx, coord in enumerate(orange_list)}
     for idx, (r, c) in enumerate(orange_list):
         for dr in range(-max_gap, max_gap + 1):
@@ -279,7 +248,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                 boundary_seats.add((r, c))
                 
         interior_cells = interior_raw | boundary_seats
-        
         walkable_cells = set()
         for (r, c) in interior_cells:
             cell = all_cells_cache.get((r, c))
@@ -291,11 +259,9 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         for seed in sorted(list(walkable_cells)):
             if seed in visited_walkable:
                 continue
-                
             comp = []
             queue = deque([seed])
             visited_walkable.add(seed)
-            
             while queue:
                 r, c = queue.popleft()
                 comp.append((r, c))
@@ -306,10 +272,8 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                         direction = 'horizontal' if r == nr else 'vertical'
                         if has_blocking_border_between(all_cells_cache, r, c, nr, nc, direction):
                             continue
-                            
                         visited_walkable.add(neighbor)
                         queue.append(neighbor)
-            
             if len(comp) >= 3:
                 sub_environments.append(set(comp))
                 
@@ -319,68 +283,43 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
             if desk_count >= 3:
                 valid_sub_environments.append(env_cells)
         
-        # --- IDENTIFICAÇÃO E ABSORÇÃO DE DESKS (PAS) NÃO ALOCADAS PELO FLOOD-FILL ---
-        # Mapeia todas as PAs reais dentro do bloco macro
         all_desks_in_block = set()
         for (r, c) in interior_cells:
             cell = all_cells_cache.get((r, c))
             if cell and is_desk_cell(cell):
                 all_desks_in_block.add((r, c))
                 
-        # Descobre quais PAs ficaram isoladas por conta de divisórias unidirecionais do Excel ou corredores
         unassigned_desks = set()
         for seat in all_desks_in_block:
             if not any(seat in env for env in valid_sub_environments):
                 unassigned_desks.add(seat)
         
-        # Processa a absorção inteligente para todas as mesas isoladas usando distâncias e afinidades físicas
         for seat in unassigned_desks:
             seat_cell = all_cells_cache.get(seat)
             seat_val = normalize_val(seat_cell.value) if seat_cell else ""
-            
             best_env = None
             highest_score = -1
-            
             for env_cells in valid_sub_environments:
-                # 1. Encontra a distância mínima de Manhattan até as células operacionais do ambiente
                 min_dist = min(manhattan_distance(seat, ec) for ec in env_cells)
-                
-                # Só avalia se o ambiente estiver a uma distância fisicamente coerente (ex: até 5 células)
                 if min_dist <= 5:
-                    # 2. Calcula limites geométricos para verificar contenção/alinhamento
                     env_r_min = min(ec[0] for ec in env_cells)
                     env_r_max = max(ec[0] for ec in env_cells)
                     env_c_min = min(ec[1] for ec in env_cells)
                     env_c_max = max(ec[1] for ec in env_cells)
-                    
                     has_containment = (env_r_min <= seat[0] <= env_r_max) or (env_c_min <= seat[1] <= env_c_max)
-                    
-                    # 3. Verifica afinidade de marcas/clientes das PAs ativas do ambiente
                     env_vals = {normalize_val(all_cells_cache[ec].value) for ec in env_cells if all_cells_cache.get(ec)}
                     env_vals.discard('')
-                    # Removida exclusão do cliente '0', mantendo-o como marcação operacional ativa
                     env_vals.discard('VAZIO')
-                    
                     has_affinity = seat_val and (seat_val in env_vals)
-                    
-                    # 4. Cálculo do Score de Fusão:
                     score = 0
-                    
-                    # Peso prioritário: afinidade com as equipes vizinhas (impede misturar clientes diferentes)
                     if has_affinity:
                         score += 15
-                        
-                    # Proximidade física (quanto mais próximo, maior o score de proximidade)
                     score += max(0, 6 - min_dist)
-                    
-                    # Alinhamento na mesma linha ou coluna do salão
                     if has_containment:
                         score += 2
-                        
                     if score > highest_score:
                         highest_score = score
                         best_env = env_cells
-                        
             if best_env is not None:
                 best_env.add(seat)
         
@@ -404,11 +343,8 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                 env_r_max = max(r for r, c in env_cells)
                 env_c_min = min(c for r, c in env_cells)
                 env_c_max = max(c for r, c in env_cells)
-                
-                # --- BUSCA DE ANOTAÇÕES/PALAVRAS VIA CACHE O(1) ---
                 env_texts = set()
                 for (r, c) in env_cells:
-                    # Varre até distância Manhattan <= 2 para pegar palavras próximas sem gargalo de CPU
                     for dr in range(-2, 3):
                         for dc in range(-2, 3):
                             if abs(dr) + abs(dc) <= 2:
@@ -418,7 +354,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                                     val = neighbor_cell.value
                                     if is_text_annotation(val):
                                         env_texts.add(str(val).strip())
-                
                 ambientes.append({
                     'id': chr(64 + sub_idx),
                     'bounding_box': (env_r_min, env_r_max, env_c_min, env_c_max),
@@ -453,16 +388,12 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         })
         idx_counter += 1
             
-    return macro_blocks
+    _orange_context_cache = macro_blocks
+    return _orange_context_cache
 
 def build_context_string_for_llm(macro_blocks: List[Dict]) -> str:
-    """
-    Formata o resumo estruturado e hierárquico dos blocos e ambientes internos
-    para contextualizar a IA durante o planejamento.
-    """
     if not macro_blocks:
         return "Nenhum macro-bloco laranja encontrado."
-        
     linhas = ["=== PREMISSAS E CONTEXTO EXTRAÍDOS DAS BORDAS LARANJAS ==="]
     for b in macro_blocks:
         b_id = b['id']
@@ -471,82 +402,9 @@ def build_context_string_for_llm(macro_blocks: List[Dict]) -> str:
             linhas.append("  📌 Anotações na borda do bloco:")
             for txt in b['texts']:
                 linhas.append(f"    - {txt}")
-        
-        # Consolida as palavras-chaves e anotações por sub-ambiente específico
         for env in b.get('ambientes', []):
             if env.get('texts'):
                 linhas.append(f"  Ambiente {b_id}-{env['id']}:")
                 for txt in env['texts']:
                     linhas.append(f"    - '{txt}'")
-            
     return "\n".join(linhas)
-
-if __name__ == '__main__':
-    wb = openpyxl.load_workbook('planta.xlsx', data_only=True)
-    ws = wb['JPIII']
-    
-    # Cache também para a impressão de logs do main teste
-    all_cells_cache = {}
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            all_cells_cache[(r, c)] = ws.cell(row=r, column=c)
-            
-    blocks = scan_orange_context('planta.xlsx', 'JPIII')
-    
-    print("\n" + "="*70)
-    print("📋 RESULTADO DA EXTRAÇÃO DE BLOCOS E SUB-AMBIENTES INTERNOS:")
-    print("="*70 + "\n")
-    
-    for idx, block in enumerate(blocks, start=1):
-        b_id = f"vazio-{idx}"
-        r_min, r_max, c_min, c_max = block['bounding_box']
-        col_min = openpyxl.utils.get_column_letter(c_min)
-        col_max = openpyxl.utils.get_column_letter(c_max)
-        
-        print(f"-------------------- Bloco {idx} ({b_id}) --------------------")
-        print(f"Localização Macro (Limites): colunas {col_min}-{col_max}, linhas {r_min}-{r_max}")
-        if block['texts']:
-            print(f"📌 Anotações na Borda do Bloco: {', '.join(block['texts'])}")
-        print()
-        
-        for env in block.get('ambientes', []):
-            env_id = env['id']
-            env_r_min, env_r_max, env_c_min, env_c_max = env['bounding_box']
-            env_col_min = openpyxl.utils.get_column_letter(env_c_min)
-            env_col_max = openpyxl.utils.get_column_letter(env_c_max)
-            
-            client_counts = {}
-            blank_count = 0
-            
-            for (r, c) in env['cells']:
-                cell = all_cells_cache.get((r, c))
-                val = cell.value if cell else None
-                val_str = str(val).strip() if val is not None else ""
-                
-                # 'vazio' e string em branco são marcados como espaço de circulação
-                if val_str == "" or val_str.upper() == 'VAZIO':
-                    blank_count += 1
-                else:
-                    norm_val = normalize_val(val)
-                    client_counts[norm_val] = client_counts.get(norm_val, 0) + 1
-                    
-            print(f"  Ambiente {env_id} ({b_id}-{env_id}):")
-            print(f"    Limites da Bounding Box: colunas {env_col_min}-{env_col_max}, linhas {env_r_min}-{env_r_max}")
-            print(f"    Células totais mapeadas fisicamente neste ambiente: {len(env['cells'])}")
-            print(f"    Espaço de circulação / células vazias (em branco): {blank_count}")
-            print("    Clientes e Status identificados:")
-            if client_counts:
-                for cli, qty in sorted(client_counts.items()):
-                    print(f"      - Marcação '{cli}': quantidade: {qty}")
-            else:
-                print("      - Nenhum operador ou marcação operacional ativa")
-            
-            print("    Anotações / Palavras identificadas neste ambiente:")
-            if env.get('texts'):
-                for txt in env['texts']:
-                    print(f"      - '{txt}'")
-            else:
-                print("      - Nenhuma palavra ou anotação identificada nas proximidades")
-            print("")
-            
-        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
