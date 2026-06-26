@@ -108,7 +108,7 @@ def separar_ambiente_e_desenhar_divisorias(
             bc_x_0 = min(c for r, c in bench_set)
             bc_x_1 = max(c for r, c in bench_set)
             
-            # --- NOVA REGRA DE PREENCHIMENTO ---
+            # --- REGRA DE PREENCHIMENTO ---
             # Só unifica e preenche os limites físicos totais da bancada original se a quantidade
             # de mesas alocadas estiver a apenas 2 (ou menos) mesas de completar a capacidade física total.
             total_capacity = len(bench_set)
@@ -128,7 +128,7 @@ def separar_ambiente_e_desenhar_divisorias(
                 target_c0 = c0
                 target_c1 = c1
                 
-            # Adiciona apenas a fração útil da bancada sob o critério de espinha e limite de sobras [0]
+            # Adiciona apenas a fração útil da bancada sob o critério estabelecido
             for r, c in bench_set:
                 if target_r0 <= r <= target_r1 and target_c0 <= c <= target_c1:
                     target_bench_cells.add((r, c))
@@ -276,31 +276,44 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
             selected.update(bench_set)
             remaining_qty -= len(bench_set)
         else:
-            # Se a bancada é maior do que o que falta, ordena as mesas de forma a priorizar 
-            # o preenchimento de colunas (para verticais) ou linhas (para horizontais) [0].
-            # Isso desvincula do BFS radial e força a ocorrência do corte de espinha [0].
+            # Temos mais mesas na bancada do que o necessário.
+            # Decidimos a ordenação de forma dinâmica conforme os limites e obstruções do grid:
             cols = {c for r, c in bench_set}
             rows = {r for r, c in bench_set}
+            
+            # Limites físicos da bancada
+            br_y_0 = min(r for r, c in bench_set)
+            br_y_1 = max(r for r, c in bench_set)
+            bc_x_0 = min(c for r, c in bench_set)
+            bc_x_1 = max(c for r, c in bench_set)
+            
             capacity_one_side = len(bench_set) // 2
             
-            if len(rows) >= len(cols):
-                # --- BANCADA VERTICAL (2 colunas) ---
-                if remaining_qty <= capacity_one_side:
-                    # Quantidade pequena: prioriza Spinal Split (Coluna primeiro, depois Linha)
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
-                else:
-                    # Quantidade grande: prioriza Bloco Compacto (Linha primeiro [face a face], depois Coluna)
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
-            else:
-                # --- BANCADA HORIZONTAL (2 linhas) ---
-                if remaining_qty <= capacity_one_side:
-                    # Quantidade pequena: prioriza Spinal Split (Linha primeiro, depois Coluna)
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
-                else:
-                    # Quantidade grande: prioriza Bloco Compacto (Coluna primeiro [face a face], depois Linha)
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+            # Verifica se o corredor de unificação (base para verticais, esquerda para horizontais) está livre
+            if len(rows) >= len(cols):  # Bancada Vertical
+                # O corredor de unificação fica na linha abaixo da base (br_y_1 + 1)
+                corredor_unificacao_livre = _eh_faixa_livre(ws, bench_set, br_y_1 + 1, br_y_1 + 1, bc_x_0, bc_x_1)
                 
-            # Seleciona exatamente o restante necessário respeitando a espinha de fiação [0]
+                # Só alocamos "de 2 em 2" (face a face) se a quantidade for alta E houver caminho de fuga na base
+                if remaining_qty > capacity_one_side and corredor_unificacao_livre:
+                    # Bloco Compacto (par face a face): ordena Linha primeiro, depois Coluna
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
+                else:
+                    # Spinal Split: ordena Coluna primeiro, depois Linha (mantém todos do mesmo lado)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+            else:  # Bancada Horizontal
+                # O corredor de unificação fica na coluna à esquerda (bc_x_0 - 1)
+                corredor_unificacao_livre = _eh_faixa_livre(ws, bench_set, br_y_0, br_y_1, bc_x_0 - 1, bc_x_0 - 1)
+                
+                # Só alocamos "de 2 em 2" se a quantidade for alta E houver caminho de fuga na esquerda
+                if remaining_qty > capacity_one_side and corredor_unificacao_livre:
+                    # Bloco Compacto (par face a face): ordena Coluna primeiro, depois Linha
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+                else:
+                    # Spinal Split: ordena Linha primeiro, depois Coluna (mantém todos do mesmo lado)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
+                
+            # Seleciona exatamente o restante necessário respeitando a restrição de fluxo
             bench_selected = set(sorted_bench[:remaining_qty])
             selected.update(bench_selected)
             remaining_qty = 0
@@ -374,7 +387,7 @@ def testar_criacao_sala_manual(
             bc_x_0 = min(c for r, c in bench_set)
             bc_x_1 = max(c for r, c in bench_set)
             
-            # --- NOVA REGRA DE PREENCHIMENTO ---
+            # --- REGRA DE PREENCHIMENTO ---
             total_capacity = len(bench_set)
             allocated_count = len(allocated_in_bench)
             missing_to_complete = total_capacity - allocated_count
@@ -393,7 +406,7 @@ def testar_criacao_sala_manual(
                 target_c0 = c0
                 target_c1 = c1
                 
-            # Adiciona apenas a fração útil da bancada sob o critério de espinha e limite de sobras [0]
+            # Adiciona apenas a fração útil da bancada sob o critério estabelecido
             for r, c in bench_set:
                 if target_r0 <= r <= target_r1 and target_c0 <= c <= target_c1:
                     target_bench_cells.add((r, c))
@@ -420,8 +433,8 @@ if __name__ == "__main__":
     testar_criacao_sala_manual(
         file_path="planta.xlsx",
         sheet_name="JPIII",
-        bloco_id="vazio-1",          
+        bloco_id="vazio-2",          
         ambiente_letra="A",         
-        quantidade_mesas=6,         
+        quantidade_mesas=124,         
         output_path="planta_teste_sala.xlsx"
     )
