@@ -108,22 +108,25 @@ def separar_ambiente_e_desenhar_divisorias(
             bc_x_0 = min(c for r, c in bench_set)
             bc_x_1 = max(c for r, c in bench_set)
             
-            cols = {c for r, c in bench_set}
-            rows = {r for r, c in bench_set}
+            # --- NOVA REGRA DE PREENCHIMENTO ---
+            # Só unifica e preenche os limites físicos totais da bancada original se a quantidade
+            # de mesas alocadas estiver a apenas 2 (ou menos) mesas de completar a capacidade física total.
+            total_capacity = len(bench_set)
+            allocated_count = len(allocated_in_bench)
+            missing_to_complete = total_capacity - allocated_count
             
-            leftover_threshold = 2
-            
-            # Aplica o recorte e unificação de bancadas duplas vertical ou horizontal [0]
-            if len(rows) >= len(cols):
-                target_r0 = br_y_0 if (r0 - br_y_0 <= leftover_threshold) else r0
-                target_r1 = br_y_1 if (br_y_1 - r1 <= leftover_threshold) else r1
-                target_c0 = c0
-                target_c1 = c1
+            if missing_to_complete <= 2:
+                # Se faltarem 2 ou menos mesas para completar o total, engloba a bancada inteira
+                target_r0 = br_y_0
+                target_r1 = br_y_1
+                target_c0 = bc_x_0
+                target_c1 = bc_x_1
             else:
+                # Caso contrário, mantém o corte rígido e ajustado (Tight Cut) ao redor das mesas alocadas
                 target_r0 = r0
                 target_r1 = r1
-                target_c0 = bc_x_0 if (c0 - bc_x_0 <= leftover_threshold) else c0
-                target_c1 = bc_x_1 if (bc_x_1 - c1 <= leftover_threshold) else c1
+                target_c0 = c0
+                target_c1 = c1
                 
             # Adiciona apenas a fração útil da bancada sob o critério de espinha e limite de sobras [0]
             for r, c in bench_set:
@@ -140,7 +143,6 @@ def separar_ambiente_e_desenhar_divisorias(
     c1 = max(c for r, c in target_bench_cells)
 
     # Determina a orientação predominante da bancada ocupada
-    # Se o número de linhas (altura) for maior ou igual ao de colunas (largura), é considerada vertical.
     is_vertical = (r1 - r0) >= (c1 - c0)
 
     # 4. Expansão Ergonômica de Corredores (1 célula de folga adaptada à orientação) [0]
@@ -279,13 +281,24 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
             # Isso desvincula do BFS radial e força a ocorrência do corte de espinha [0].
             cols = {c for r, c in bench_set}
             rows = {r for r, c in bench_set}
+            capacity_one_side = len(bench_set) // 2
             
             if len(rows) >= len(cols):
-                # Bancada vertical: ordena Coluna primeiro, depois Linha [0]
-                sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+                # --- BANCADA VERTICAL (2 colunas) ---
+                if remaining_qty <= capacity_one_side:
+                    # Quantidade pequena: prioriza Spinal Split (Coluna primeiro, depois Linha)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+                else:
+                    # Quantidade grande: prioriza Bloco Compacto (Linha primeiro [face a face], depois Coluna)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
             else:
-                # Bancada horizontal: ordena Linha primeiro, depois Coluna [0]
-                sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
+                # --- BANCADA HORIZONTAL (2 linhas) ---
+                if remaining_qty <= capacity_one_side:
+                    # Quantidade pequena: prioriza Spinal Split (Linha primeiro, depois Coluna)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
+                else:
+                    # Quantidade grande: prioriza Bloco Compacto (Coluna primeiro [face a face], depois Linha)
+                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
                 
             # Seleciona exatamente o restante necessário respeitando a espinha de fiação [0]
             bench_selected = set(sorted_bench[:remaining_qty])
@@ -361,22 +374,24 @@ def testar_criacao_sala_manual(
             bc_x_0 = min(c for r, c in bench_set)
             bc_x_1 = max(c for r, c in bench_set)
             
-            cols = {c for r, c in bench_set}
-            rows = {r for r, c in bench_set}
+            # --- NOVA REGRA DE PREENCHIMENTO ---
+            total_capacity = len(bench_set)
+            allocated_count = len(allocated_in_bench)
+            missing_to_complete = total_capacity - allocated_count
             
-            leftover_threshold = 2
-            
-            # Aplica o recorte e unificação de bancadas duplas vertical ou horizontal [0]
-            if len(rows) >= len(cols):
-                target_r0 = br_y_0 if (r0 - br_y_0 <= leftover_threshold) else r0
-                target_r1 = br_y_1 if (br_y_1 - r1 <= leftover_threshold) else r1
-                target_c0 = c0
-                target_c1 = c1
+            if missing_to_complete <= 2:
+                # Se faltarem apenas 2 ou menos mesas para preencher o bloco inteiro,
+                # unifica e estende as divisórias até as bordas físicas da bancada original.
+                target_r0 = br_y_0
+                target_r1 = br_y_1
+                target_c0 = bc_x_0
+                target_c1 = bc_x_1
             else:
+                # Caso contrário, mantém o corte rígido e ajustado (Tight Cut) ao redor das mesas alocadas
                 target_r0 = r0
                 target_r1 = r1
-                target_c0 = bc_x_0 if (c0 - bc_x_0 <= leftover_threshold) else c0
-                target_c1 = bc_x_1 if (bc_x_1 - c1 <= leftover_threshold) else c1
+                target_c0 = c0
+                target_c1 = c1
                 
             # Adiciona apenas a fração útil da bancada sob o critério de espinha e limite de sobras [0]
             for r, c in bench_set:
@@ -405,7 +420,7 @@ if __name__ == "__main__":
     testar_criacao_sala_manual(
         file_path="planta.xlsx",
         sheet_name="JPIII",
-        bloco_id="vazio-2",          
+        bloco_id="vazio-1",          
         ambiente_letra="A",         
         quantidade_mesas=6,         
         output_path="planta_teste_sala.xlsx"
