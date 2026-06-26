@@ -139,13 +139,32 @@ def separar_ambiente_e_desenhar_divisorias(
     c0 = min(c for r, c in target_bench_cells)
     c1 = max(c for r, c in target_bench_cells)
 
-    # 4. Expansão Ergonômica de Corredores (1 célula de folga nas laterais e base se for corredor livre) [0]
-    # O código só expande em uma direção se as células vizinhas forem de fato vazios transitáveis [0].
-    room_c0 = c0 - 1 if _eh_faixa_livre(ws, target_bench_cells, r0, r1, c0 - 1, c0 - 1) else c0
-    room_c1 = c1 + 1 if _eh_faixa_livre(ws, target_bench_cells, r0, r1, c1 + 1, c1 + 1) else c1
-    room_r0 = r0  # Mantém o topo flush com as mesas para não bloquear circulações públicas horizontais
-    room_r1 = r1 + 1 if _eh_faixa_livre(ws, target_bench_cells, r1 + 1, r1 + 1, c0, c1) else r1
+    # Determina a orientação predominante da bancada ocupada
+    # Se o número de linhas (altura) for maior ou igual ao de colunas (largura), é considerada vertical.
+    is_vertical = (r1 - r0) >= (c1 - c0)
 
+    # 4. Expansão Ergonômica de Corredores (1 célula de folga adaptada à orientação) [0]
+    # O código só expande em uma direção se as células vizinhas forem de fato vazios transitáveis [0].
+    if is_vertical:
+        # Bancada Vertical:
+        # Operadores recuam para as laterais (esquerda/direita).
+        # Topo permanece flush para preservar corredores horizontais públicos.
+        # Base expande para criar o corredor de circulação e colocar a catraca (CT).
+        room_c0 = c0 - 1 if _eh_faixa_livre(ws, target_bench_cells, r0, r1, c0 - 1, c0 - 1) else c0
+        room_c1 = c1 + 1 if _eh_faixa_livre(ws, target_bench_cells, r0, r1, c1 + 1, c1 + 1) else c1
+        room_r0 = r0
+        room_r1 = r1 + 1 if _eh_faixa_livre(ws, target_bench_cells, r1 + 1, r1 + 1, c0, c1) else r1
+    else:
+        # Bancada Horizontal:
+        # Operadores recuam para cima (topo) e para baixo (base).
+        # Lateral direita permanece flush para preservar corredores verticais públicos.
+        # Lateral esquerda expande para unificar a circulação (conectar topo e base) e colocar a catraca (CT).
+        room_r0 = r0 - 1 if _eh_faixa_livre(ws, target_bench_cells, r0 - 1, r0 - 1, c0, c1) else r0
+        room_r1 = r1 + 1 if _eh_faixa_livre(ws, target_bench_cells, r1 + 1, r1 + 1, c0, c1) else r1
+        room_c0 = c0 - 1 if _eh_faixa_livre(ws, target_bench_cells, r0, r1, c0 - 1, c0 - 1) else c0
+        room_c1 = c1
+
+    print(f"      [DIVISÓRIAS] Orientação Detectada: {'Vertical' if is_vertical else 'Horizontal'}")
     print(f"      [DIVISÓRIAS] Bancada Ocupada: Linhas {r0}-{r1}, Colunas {c0}-{c1}")
     print(f"      [DIVISÓRIAS] Sala com Recuo e Catraca: Linhas {room_r0}-{room_r1}, Colunas {room_c0}-{room_c1}")
 
@@ -368,7 +387,7 @@ def testar_criacao_sala_manual(
         target_bench_cells = allocated_cells
 
     # 3. Nenhuma modificação visual ou de valor nas células internas é feita.
-    # As mesas preservam suas cores, valores e fontes originais intactos do Excel.
+    # As mesas preservam suas cores, valores e fontes originais intactas do Excel.
 
     # 4. Desenha as divisórias de contorno considerando a BANCADA OU FRAÇÃO UNIFICADA (target_bench_cells) [0]
     separar_ambiente_e_desenhar_divisorias(
@@ -388,6 +407,6 @@ if __name__ == "__main__":
         sheet_name="JPIII",
         bloco_id="vazio-2",          
         ambiente_letra="A",         
-        quantidade_mesas=12,         
+        quantidade_mesas=6,         
         output_path="planta_teste_sala.xlsx"
     )
