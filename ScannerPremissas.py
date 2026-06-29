@@ -119,12 +119,17 @@ def cell_has_orange_border_or_fill(cell) -> bool:
     return cell_has_orange_fill(cell) or cell_has_orange_border(cell)
 
 def is_desk_cell(cell) -> bool:
+    """Verifica se a célula representa uma mesa de operador."""
     if cell is None or cell.value is None:
         return False
     val_str = str(cell.value).strip()
     val_upper = val_str.upper()
     try:
-        float(val_upper)
+        val_num = float(val_upper)
+        # Se o valor numérico for maior que 9, trata-se de uma anotação de texto (ex: "124" ou "144"),
+        # e não de uma posição física de atendimento (PA).
+        if val_num > 9:
+            return False
         return True
     except ValueError:
         pass
@@ -179,7 +184,6 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
 
 def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
     global _orange_context_cache
-    # Retorna o contexto estruturado em cache se já foi lido uma vez
     if _orange_context_cache is not None:
         return _orange_context_cache
 
@@ -235,21 +239,14 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
     macro_blocks = []
     valid_groups = [coords for coords in groups.values() if len(coords) >= 10]
     
-    # ══════════════════════════════════════════════════════════════════════════
-    # ORDENAÇÃO ROBUSTA: TOP-TO-BOTTOM (LINHAS) E LEFT-TO-RIGHT (COLUNAS)
-    # ══════════════════════════════════════════════════════════════════════════
-    # 1. Pré-calcula os limites mínimos de linha e coluna para cada bloco
     valid_groups_meta = []
     for coords in valid_groups:
         min_r = min(r for r, c in coords)
         min_c = min(c for r, c in coords)
         valid_groups_meta.append((min_r, min_c, coords))
         
-    # 2. Ordena preliminarmente de cima para baixo (pela linha inicial)
     valid_groups_meta.sort(key=lambda x: x[0])
     
-    # 3. Agrupa os blocos em "bandas horizontais" virtuais usando uma tolerância vertical (ex: 15 linhas)
-    # Isso evita que pequenos desalinhamentos de desenho (ex: linha 5 vs linha 6) quebrem a ordem horizontal
     bands = []
     current_band = []
     row_tolerance = 15
@@ -258,7 +255,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         if not current_band:
             current_band.append(item)
         else:
-            # Se o bloco atual começa muito próximo do primeiro bloco desta banda, agrupamos na mesma linha de leitura
             if item[0] - current_band[0][0] <= row_tolerance:
                 current_band.append(item)
             else:
@@ -267,13 +263,11 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
     if current_band:
         bands.append(current_band)
         
-    # 4. Ordena cada banda interna da esquerda para a direita (por coluna) e reconstrói a lista de grupos
     valid_groups = []
     for band in bands:
         band.sort(key=lambda x: x[1])
         for item in band:
             valid_groups.append(item[2])
-    # ══════════════════════════════════════════════════════════════════════════
     
     idx_counter = 1
     for coords in valid_groups:
