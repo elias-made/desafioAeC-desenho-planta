@@ -1,3 +1,5 @@
+# Agents.py
+
 from dataclasses import dataclass
 from typing import List, Dict, Set, Tuple
 from pydantic_ai import Agent, RunContext
@@ -20,6 +22,7 @@ class OrganizadorDeps:
     blocos_info: str
     premissas: str
     rascunho_layout: str
+    ambientes_criados: str  # Informações de salas físicas geradas pelo AmbienteBuilder
 
 # ══════════════════════════════════════════════════════════════════════════
 # Inicialização dos Agentes (Fluxo Unificado de 2 Etapas)
@@ -50,5 +53,6 @@ def organizador_prompt(ctx: RunContext[OrganizadorDeps]) -> str:
     return Prompts.ORGANIZADOR_TMPL.format(
         rascunho_layout=ctx.deps.rascunho_layout,
         premissas=ctx.deps.premissas,
-        blocos_info=ctx.deps.blocos_info
+        blocos_info=ctx.deps.blocos_info,
+        ambientes_criados=ctx.deps.ambientes_criados
     )

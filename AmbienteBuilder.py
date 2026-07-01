@@ -13,6 +13,35 @@ from ScannerPremissas import scan_orange_context
 # Funções de Fluxo, Contornos e Divisórias Dinâmicas (Sem Hardcode)
 # ══════════════════════════════════════════════════════════════════════════
 
+def _eh_celula_de_mesa_local(cell) -> bool:
+    """Verifica de forma dinâmica e sem hardcode se a célula representa uma mesa de operador."""
+    if cell is None or cell.value is None:
+        return False
+    from ScannerPremissas import is_desk_cell, is_barrier_cell, cell_has_orange_fill
+    
+    # Se o scanner base já identificar como mesa, valida imediatamente
+    if is_desk_cell(cell):
+        return True
+        
+    val = str(cell.value).strip().upper()
+    if val:
+        # Se for barreira física ou bloco preenchido de laranja, não é mesa
+        if is_barrier_cell(cell) or cell_has_orange_fill(cell):
+            return False
+        # Evita tratar marcadores de corredores/salas conhecidos como mesas
+        if val in ('SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS', '##'):
+            return False
+        # Evita números altos de anotações (metas como 120, 144) se forem puramente numéricos maiores que 9
+        try:
+            val_num = float(val)
+            if val_num > 9:
+                return False
+        except ValueError:
+            pass
+        # Qualquer outro texto (como RENT, ADM, etc.) em célula não-barreira é uma mesa dinâmica
+        return True
+    return False
+
 def _tem_parede_laranja_entre(ws, r1, c1, r2, c2) -> bool:
     """Verifica se existe uma parede física laranjada (borda de contorno do ambiente) entre as duas células."""
     if r1 < 1 or r1 > ws.max_row or c1 < 1 or c1 > ws.max_column:
@@ -29,7 +58,6 @@ def _tem_parede_laranja_entre(ws, r1, c1, r2, c2) -> bool:
         if not side.color or not side.color.value:
             return False
         c_val = str(side.color.value).strip().upper()
-        # Captura "FF9900", "FFFF9900" ou qualquer variante de laranja do projeto
         return "9900" in c_val or "FF99" in c_val
 
     # Movimento horizontal (esquerda / direita)
@@ -51,6 +79,17 @@ def _tem_parede_laranja_entre(ws, r1, c1, r2, c2) -> bool:
                 
     return False
 
+def _eh_catraca_do_nosso_ambiente(ws, env_cells: Set[Tuple[int, int]], r: int, c: int) -> bool:
+    """Verifica se a célula (r, c) é uma catraca que está fisicamente encostada (sem parede laranja) no nosso ambiente base."""
+    if (r, c) in env_cells:
+        return True
+    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        nr, nc = r + dr, c + dc
+        if (nr, nc) in env_cells:
+            if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                return True
+    return False
+
 def _eh_pilar_ou_coluna(ws, r, c) -> bool:
     """Verifica se a célula especificada é um pilar ou coluna física estrutural (preto ou ##)."""
     if r < 1 or r > ws.max_row or c < 1 or c > ws.max_column:
@@ -65,27 +104,42 @@ def _eh_pilar_ou_coluna(ws, r, c) -> bool:
     return False
 
 def _eh_faixa_livre(ws, env_cells: Set[Tuple[int, int]], r0, r1, c0, c1) -> bool:
-    """Verifica se todas as células no retângulo [r0, r1] x [c0, c1] são corredores livres (sem barreiras ou mesas de outros clientes)."""
+    """Verifica se todas as células no retângulo [r0, r1] x [c0, c1] são corredores livres (sem barreiras ou mesas)."""
     if r0 < 1 or r1 > ws.max_row or c0 < 1 or c1 > ws.max_column:
         return False
-    from ScannerPremissas import is_desk_cell, is_barrier_cell, cell_has_orange_fill
+    from ScannerPremissas import is_barrier_cell, cell_has_orange_fill
     for r in range(r0, r1 + 1):
         for c in range(c0, c1 + 1):
             cell = ws.cell(row=r, column=c)
             val = str(cell.value).strip().upper() if cell.value is not None else ""
             
-            # Se for uma mesa de operador, ela só bloqueia se pertencer a outro cliente (estiver fora de env_cells)
-            if is_desk_cell(cell) or val.startswith("NOVO"):
-                if (r, c) not in env_cells:
-                    return False
-            
-            # Se for pilar estrutural (##), CT de outra sala ou bloco laranja sólido, bloqueia a expansão
-            if is_barrier_cell(cell) or cell_has_orange_fill(cell) or val in ("CT", "CATRACA"):
+            # Bloqueio absoluto: qualquer mesa física (local ou não) não pode ser tratada como corredor de circulação
+            if _eh_celula_de_mesa_local(cell) or val.startswith("N_"):
                 return False
+            
+            eh_nossa_catraca = False
+            if val in ("CT", "CATRACA"):
+                if _eh_catraca_do_nosso_ambiente(ws, env_cells, r, c):
+                    eh_nossa_catraca = True
+            
+            if not eh_nossa_catraca:
+                if is_barrier_cell(cell):
+                    if val in ('SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'ESCANINHOS'):
+                        if (r, c) not in env_cells:
+                            return False
+                    else:
+                        return False
+                        
+                if cell_has_orange_fill(cell):
+                    return False
+                    
+                if val in ("CT", "CATRACA"):
+                    return False
     return True
 
+# Modifique a assinatura de get_env_cells para suportar o fallback inteligente de letras
 def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
-    """Identifica as coordenadas de células pertencentes a um ambiente dentro de um bloco específico."""
+    """Identifica as coordenadas de células de forma tolerante a alucinações de letras."""
     if not block_id_str or not env_letter:
         return []
     block_match = re.search(r'\d+', str(block_id_str))
@@ -95,7 +149,13 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
     if block_idx <= len(macro_blocks):
         block = macro_blocks[block_idx - 1]
         block_envs = {e['id'].upper(): e for e in block.get('ambientes', [])}
-        parts = re.split(r'[-_\s+&,|/]+', env_letter.upper())
+        
+        # Fallback se o LLM pedir B mas só existir o ambiente A na planta física
+        target_env = env_letter.upper()
+        if target_env not in block_envs and len(block_envs) == 1:
+            target_env = list(block_envs.keys())[0]
+            
+        parts = re.split(r'[-_\s+&,|/]+', target_env)
         matched_envs = []
         for p in parts:
             if p in block_envs:
@@ -106,7 +166,6 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
                 cells.extend(env['cells'])
             return cells
     return []
-
 def separar_ambiente_e_desenhar_divisorias(
     ws, 
     env_cells: Set[Tuple[int, int]], 
@@ -122,7 +181,6 @@ def separar_ambiente_e_desenhar_divisorias(
     if not allocated_cells or not env_cells:
         return
 
-    from ScannerPremissas import is_desk_cell
     from BlockMapper import flood_fill
 
     side_style = Side(border_style=border_style, color=border_color)
@@ -136,7 +194,7 @@ def separar_ambiente_e_desenhar_divisorias(
     for r, c in env_cells:
         cell = ws.cell(row=r, column=c)
         val_str = str(cell.value).strip().upper() if cell.value is not None else ""
-        if is_desk_cell(cell) or (r, c) in allocated or val_str.startswith("NOVO"):
+        if _eh_celula_de_mesa_local(cell) or (r, c) in allocated or val_str.startswith("N_"):
             all_desks_in_env.add((r, c))
 
     benches = flood_fill(all_desks_in_env)
@@ -165,7 +223,16 @@ def separar_ambiente_e_desenhar_divisorias(
             allocated_count = len(allocated_in_bench)
             missing_to_complete = total_capacity - allocated_count
             
-            if missing_to_complete <= 2 and not corte_colunas_intencional and not corte_linhas_intencional:
+            # Calcula o impacto acumulado do preenchimento desta bancada no excesso global da meta
+            excesso_potencial_global = (len(target_bench_cells) + missing_to_complete) - len(allocated)
+            
+            # Se a meta já foi atingida pela seleção, não permite nenhuma sobra adicional (trava em zero)
+            max_excesso_permitido = 0 if len(allocated) >= len(allocated_cells) else 2
+            
+            if (missing_to_complete <= 2 
+                    and not corte_colunas_intencional 
+                    and not corte_linhas_intencional 
+                    and excesso_potencial_global <= max_excesso_permitido):
                 target_bench_cells.update(bench_set)
             else:
                 target_bench_cells.update(allocated_in_bench)
@@ -210,11 +277,20 @@ def separar_ambiente_e_desenhar_divisorias(
             # Corredor Inferior (Unificador/Conector de Escape feito célula a célula)
             left_col = c0_b - 1 if (r1_b, c0_b - 1) in room_cells else c0_b
             right_col = c1_b + 1 if (r1_b, c1_b + 1) in room_cells else c1_b
-            for c in range(left_col, right_col + 1):
-                target_cell = (r1_b + 1, c)
-                if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
-                    if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
-                        room_cells.add(target_cell)
+            
+            # Validação dinâmica de miolo para conector horizontal inferior
+            miolo_livre_inferior = True
+            for c in range(c0_b, c1_b + 1):
+                if not _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c) or _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
+                    miolo_livre_inferior = False
+                    break
+                    
+            if miolo_livre_inferior:
+                for c in range(left_col, right_col + 1):
+                    target_cell = (r1_b + 1, c)
+                    if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
+                        if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
+                            room_cells.add(target_cell)
         else:
             # Corredor Superior (Egress): expande se não houver parede laranja no caminho
             for c in range(c0_b, c1_b + 1):
@@ -233,19 +309,38 @@ def separar_ambiente_e_desenhar_divisorias(
             # Corredor Esquerdo (Unificador/Conector feito célula a célula)
             top_row = r0_b - 1 if (r0_b - 1, c0_b) in room_cells else r0_b
             bottom_row = r1_b + 1 if (r1_b + 1, c0_b) in room_cells else r1_b
-            for r in range(top_row, bottom_row + 1):
-                target_cell = (r, c0_b - 1)
-                if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
-                    if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
-                        room_cells.add(target_cell)
+            
+            # Validação dinâmica de miolo para conector vertical esquerdo
+            miolo_livre_esquerdo = True
+            for r in range(r0_b, r1_b + 1):
+                if not _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1) or _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
+                    miolo_livre_esquerdo = False
+                    break
+                    
+            if miolo_livre_esquerdo:
+                for r in range(top_row, bottom_row + 1):
+                    target_cell = (r, c0_b - 1)
+                    if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
+                        if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
+                            room_cells.add(target_cell)
+                            
             # Corredor Direito (Unificador/Conector feito célula a célula - independente)
             top_row = r0_b - 1 if (r0_b - 1, c1_b) in room_cells else r0_b
             bottom_row = r1_b + 1 if (r1_b + 1, c1_b) in room_cells else r1_b
-            for r in range(top_row, bottom_row + 1):
-                target_cell = (r, c1_b + 1)
-                if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
-                    if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
-                        room_cells.add(target_cell)
+            
+            # Validação dinâmica de miolo para conector vertical direito
+            miolo_livre_direito = True
+            for r in range(r0_b, r1_b + 1):
+                if not _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1) or _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
+                    miolo_livre_direito = False
+                    break
+                    
+            if miolo_livre_direito:
+                for r in range(top_row, bottom_row + 1):
+                    target_cell = (r, c1_b + 1)
+                    if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
+                        if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
+                            room_cells.add(target_cell)
 
     # 3.5. PONTE DE CORREDOR VERTICAL (UNIFICAÇÃO DE ILHAS DE SALAS)
     corridor_columns = {c for r, c in (room_cells - target_bench_cells)}
@@ -260,7 +355,6 @@ def separar_ambiente_e_desenhar_divisorias(
                     all_gap_free = True
                     for gr in gap_rows:
                         target_cell = (gr, col)
-                        # A ponte não deve cruzar paredes laranjas físicas e deve estar desobstruída
                         if _tem_parede_laranja_entre(ws, gr - 1, col, gr, col) or not _eh_faixa_livre(ws, env_cells, gr, gr, col, col):
                             all_gap_free = False
                             break
@@ -294,18 +388,19 @@ def separar_ambiente_e_desenhar_divisorias(
         cell_ct.font = font_ct
 
     # 5. DESENHO DAS DIVISÓRIAS (CONTORNO DA SALA CÉLULA A CÉLULA)
+    # Sempre desenha as bordas limitantes do contorno da sala, independente de pilares vizinhos.
     for r, c in room_cells:
         # Topo
-        if (r - 1, c) not in room_cells and not _eh_pilar_ou_coluna(ws, r - 1, c):
+        if (r - 1, c) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'top', side_style)
         # Base
-        if (r + 1, c) not in room_cells and not _eh_pilar_ou_coluna(ws, r + 1, c):
+        if (r + 1, c) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'bottom', side_style)
         # Esquerda
-        if (r, c - 1) not in room_cells and not _eh_pilar_ou_coluna(ws, r, c - 1):
+        if (r, c - 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'left', side_style)
         # Direita
-        if (r, c + 1) not in room_cells and not _eh_pilar_ou_coluna(ws, r, c + 1):
+        if (r, c + 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'right', side_style)
 
 def _copiar_lado(side_obj):
@@ -329,16 +424,16 @@ def _aplicar_borda_celula_unica(ws, r, c, side, side_style):
     cell.border = Border(top=top, bottom=bottom, left=left, right=right)
 
 def _aplicar_borda_espelhada(ws, r, c, side, side_style):
-    _aplicar_borda_espelhada_unica = _aplicar_borda_celula_unica
-    _aplicar_borda_espelhada_unica(ws, r, c, side, side_style)
-    if side == 'bottom':
-        _aplicar_borda_espelhada_unica(ws, r + 1, c, 'top', side_style)
-    elif side == 'top':
-        _aplicar_borda_espelhada_unica(ws, r - 1, c, 'bottom', side_style)
-    elif side == 'right':
-        _aplicar_borda_espelhada_unica(ws, r, c + 1, 'left', side_style)
-    elif side == 'left':
-        _aplicar_borda_espelhada_unica(ws, r, c - 1, 'right', side_style)
+    """Aplica a borda de forma espelhada e dinâmica validando os limites da planilha."""
+    _aplicar_borda_celula_unica(ws, r, c, side, side_style)
+    if side == 'bottom' and r + 1 <= ws.max_row:
+        _aplicar_borda_celula_unica(ws, r + 1, c, 'top', side_style)
+    elif side == 'top' and r - 1 >= 1:
+        _aplicar_borda_celula_unica(ws, r - 1, c, 'bottom', side_style)
+    elif side == 'right' and c + 1 <= ws.max_column:
+        _aplicar_borda_celula_unica(ws, r, c + 1, 'left', side_style)
+    elif side == 'left' and c - 1 >= 1:
+        _aplicar_borda_celula_unica(ws, r, c - 1, 'right', side_style)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Função de Seleção e Execução de Teste Manual
@@ -346,86 +441,164 @@ def _aplicar_borda_espelhada(ws, r, c, side, side_style):
 
 def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty: int) -> Set[Tuple[int, int]]:
     """
-    Busca e reserva mesas de forma estruturada, agrupando e isolando colunas/linhas físicas
-    de bancadas para evitar a expansão desnecessária do Bounding Box geral.
+    Busca e reserva mesas de forma estruturada, agrupando as bancadas em Macro-Clusters espaciais.
+    Mantém a ordem exata de preenchimento para garantir que truncamentos de metas ímpares
+    ocorram estritamente na ponta da última bancada em uso, preservando os blocos anteriores.
     """
-    from ScannerPremissas import is_desk_cell
-    from BlockMapper import flood_fill
-    
     all_desks = set()
     for r, c in env_cells:
         cell = ws.cell(row=r, column=c)
-        if is_desk_cell(cell):
+        if _eh_celula_de_mesa_local(cell):
             all_desks.add((r, c))
             
     if not all_desks:
         return set()
         
+    from BlockMapper import flood_fill
     benches = flood_fill(all_desks)
+    n_benches = len(benches)
+    if n_benches == 0:
+        return set()
+        
+    # --- AGRUPAMENTO DAS BANCADAS EM MACRO-CLUSTERS ESPACIAIS (UNIÃO E BUSCA) ---
+    parent = list(range(n_benches))
     
-    vertical_benches = []
-    horizontal_benches = []
-    for b in benches:
-        b_rows = {r for r, c in b}
-        b_cols = {c for r, c in b}
-        if len(b_rows) >= len(b_cols):
-            vertical_benches.append(b)
-        else:
-            horizontal_benches.append(b)
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+        
+    def union(i, j):
+        root_i = find(i)
+        root_j = find(j)
+        if root_i != root_j:
+            parent[root_i] = root_j
             
-    is_mostly_vertical = len(vertical_benches) >= len(horizontal_benches)
-    selected = set()
-    
-    # ══════════════════════════════════════════════════════════════════════════
-    # BUSCA DE CORTE SIMÉTRICO OTIMAL COM PONTUAÇÃO E TOMADA DE DECISÃO HIERÁRQUICA
-    # ══════════════════════════════════════════════════════════════════════════
-    if is_mostly_vertical and vertical_benches:
-        vertical_benches.sort(key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
-        groups = []
-        for b in vertical_benches:
-            br_y_0 = min(r for r, c in b)
-            placed = False
-            for grp in groups:
-                if abs(min(r for r, c in grp[0]) - br_y_0) <= 2:
-                    grp.append(b)
-                    placed = True
-                    break
-            if not placed:
-                groups.append([b])
-        
-        valid_groups = [grp for grp in groups if sum(len(b) for b in grp) >= target_qty]
-        if valid_groups:
-            valid_groups.sort(key=lambda grp: min(min(r for r, c in b) for b in grp))
-            benches_to_use = valid_groups[0]
-        else:
-            benches_to_use = vertical_benches
-            
-        max_rows = max(len({r for r, c in b}) for b in benches_to_use)
-        
-        best_N, best_H = None, None
-        candidates = []
-        
-        for N in range(1, len(benches_to_use) + 1):
-            for H in range(1, max_rows + 1):
-                cap = 0
-                for b in benches_to_use[:N]:
-                    b_rows_sorted = sorted(list({r for r, c in b}))
-                    allowed_rows = set(b_rows_sorted[:H])
-                    cap += sum(1 for r, c in b if r in allowed_rows)
+    for i in range(n_benches):
+        for j in range(i + 1, n_benches):
+            min_dist = min(
+                abs(r1 - r2) + abs(c1 - c2)
+                for r1, c1 in benches[i]
+                for r2, c2 in benches[j]
+            )
+            if min_dist <= 4:
+                union(i, j)
                 
-                if cap >= target_qty:
-                    excess = cap - target_qty
-                    corridor_height = max_rows - H
-                    candidates.append((cap, N, H, excess, corridor_height))
+    from collections import defaultdict
+    clusters_map = defaultdict(list)
+    for i in range(n_benches):
+        clusters_map[find(i)].append(benches[i])
         
-        if candidates:
-            # 1. Menor excesso, 2. Menor N, 3. Maior Corredor
-            candidates.sort(key=lambda x: (x[3], x[1], -x[4]))
-            best_N = candidates[0][1]
-            best_H = candidates[0][2]
-        else:
-            # Fallback Escassez
-            deficit_candidates = []
+    clusters = list(clusters_map.values())
+    
+    # --- INTELIGÊNCIA DE PARIDADE FACE-A-FACE ---
+    adjusted_target_qty = target_qty
+    possui_bancada_dupla = False
+    for cl in clusters:
+        for b in cl:
+            b_cols = {c for r, c in b}
+            b_rows = {r for r, c in b}
+            if len(b_cols) == 2 or len(b_rows) == 2:
+                possui_bancada_dupla = True
+                break
+        if possui_bancada_dupla:
+            break
+            
+    if possui_bancada_dupla and adjusted_target_qty % 2 != 0:
+        adjusted_target_qty += 1
+
+    valid_clusters = []
+    for cl in clusters:
+        cap = sum(len(b) for b in cl)
+        if cap >= adjusted_target_qty:
+            valid_clusters.append((cl, cap))
+            
+    if valid_clusters:
+        valid_clusters.sort(key=lambda x: x[1])
+        selected_benches = valid_clusters[0][0]
+    else:
+        clusters_with_cap = []
+        for cl in clusters:
+            cap = sum(len(b) for b in cl)
+            clusters_with_cap.append((cl, cap))
+        clusters_with_cap.sort(key=lambda x: -x[1])
+        
+        selected_benches = []
+        for cl, cap in clusters_with_cap:
+            selected_benches.extend(cl)
+            
+    # --- PREPARAÇÃO DE SESSÃO ORDENADA DE SELEÇÃO ---
+    selected_set = set()
+    selected_list = []
+    
+    # Verificação se a meta exige mais mesas do que a maior bancada individual suporta.
+    max_bench_cap = max(len(b) for b in selected_benches) if selected_benches else 0
+    
+    if adjusted_target_qty > max_bench_cap:
+        # PRIORIZAÇÃO DE PREENCHIMENTO COMPLETO DE CADA BLOCO/BANCADA
+        # Ordenamos espacialmente as bancadas para garantir preenchimento linear contínuo
+        selected_benches_sorted = sorted(selected_benches, key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
+        
+        remaining_qty = adjusted_target_qty
+        for b in selected_benches_sorted:
+            if remaining_qty <= 0:
+                break
+                
+            b_cols = {c for r, c in b}
+            b_rows = {r for r, c in b}
+            if len(b_rows) >= len(b_cols):  # Vertical
+                sorted_cells = sorted(list(b), key=lambda x: (x[0], x[1]))
+            else:  # Horizontal
+                sorted_cells = sorted(list(b), key=lambda x: (x[1], x[0]))
+                
+            take_qty = min(len(sorted_cells), remaining_qty)
+            for cell in sorted_cells[:take_qty]:
+                if cell not in selected_set:
+                    selected_set.add(cell)
+                    selected_list.append(cell)
+            remaining_qty -= take_qty
+            
+    else:
+        # SE A META COUBER INTEIRA EM UMA ÚNICA BANCADA, PRESERVA A BUSCA DE CORTE SIMÉTRICO OTIMAL
+        vertical_benches = []
+        horizontal_benches = []
+        for b in selected_benches:
+            b_rows = {r for r, c in b}
+            b_cols = {c for r, c in b}
+            if len(b_rows) >= len(b_cols):
+                vertical_benches.append(b)
+            else:
+                horizontal_benches.append(b)
+                
+        is_mostly_vertical = len(vertical_benches) >= len(horizontal_benches)
+        
+        if is_mostly_vertical and vertical_benches:
+            vertical_benches.sort(key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
+            groups = []
+            for b in vertical_benches:
+                br_y_0 = min(r for r, c in b)
+                placed = False
+                for grp in groups:
+                    if abs(min(r for r, c in grp[0]) - br_y_0) <= 2:
+                        grp.append(b)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([b])
+            
+            valid_groups = [grp for grp in groups if sum(len(b) for b in grp) >= adjusted_target_qty]
+            if valid_groups:
+                valid_groups.sort(key=lambda grp: min(min(r for r, c in b) for b in grp))
+                benches_to_use = valid_groups[0]
+            else:
+                benches_to_use = vertical_benches
+                
+            max_rows = max(len({r for r, c in b}) for b in benches_to_use)
+            
+            best_N, best_H = None, None
+            candidates = []
+            
             for N in range(1, len(benches_to_use) + 1):
                 for H in range(1, max_rows + 1):
                     cap = 0
@@ -433,75 +606,81 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                         b_rows_sorted = sorted(list({r for r, c in b}))
                         allowed_rows = set(b_rows_sorted[:H])
                         cap += sum(1 for r, c in b if r in allowed_rows)
-                    corridor_height = max_rows - H
-                    deficit_candidates.append((cap, N, H, corridor_height))
-            
-            deficit_candidates.sort(key=lambda x: (-x[0], x[1], -x[3]))
-            best_N = deficit_candidates[0][1]
-            best_H = deficit_candidates[0][2]
-        
-        if best_N is not None and best_H is not None:
-            remaining_qty = target_qty
-            for b in benches_to_use[:best_N]:
-                b_rows_sorted = sorted(list({r for r, c in b}))
-                allowed_rows = set(b_rows_sorted[:best_H])
-                allowed_cells = [cell for cell in b if cell[0] in allowed_rows]
-                # --- ORDENAÇÃO DE 2 EM 2 PARA VERTICAIS: LINHA PRIMEIRO ---
-                allowed_cells.sort(key=lambda x: (x[0], x[1]))
-                
-                take_qty = min(len(allowed_cells), remaining_qty)
-                selected.update(allowed_cells[:take_qty])
-                remaining_qty -= take_qty
-                if remaining_qty <= 0:
-                    break
                     
-    elif not is_mostly_vertical and horizontal_benches:
-        horizontal_benches.sort(key=lambda b: (min(c for r, c in b), min(r for r, c in b)))
-        groups = []
-        for b in horizontal_benches:
-            bc_x_0 = min(c for r, c in b)
-            placed = False
-            for grp in groups:
-                if abs(min(c for r, c in grp[0]) - bc_x_0) <= 2:
-                    grp.append(b)
-                    placed = True
-                    break
-            if not placed:
-                groups.append([b])
-        
-        valid_groups = [grp for grp in groups if sum(len(b) for b in grp) >= target_qty]
-        if valid_groups:
-            valid_groups.sort(key=lambda grp: min(min(c for r, c in b) for b in grp))
-            benches_to_use = valid_groups[0]
-        else:
-            benches_to_use = horizontal_benches
+                    if cap >= adjusted_target_qty:
+                        excess = cap - adjusted_target_qty
+                        corridor_height = max_rows - H
+                        candidates.append((cap, N, H, excess, corridor_height))
             
-        max_cols = max(len({c for r, c in b}) for b in benches_to_use)
-        
-        best_N, best_W = None, None
-        candidates = []
-        
-        for N in range(1, len(benches_to_use) + 1):
-            for W in range(1, max_cols + 1):
-                cap = 0
-                for b in benches_to_use[:N]:
-                    b_cols_sorted = sorted(list({c for r, c in b}))
-                    allowed_cols = set(b_cols_sorted[:W])
-                    cap += sum(1 for r, c in b if c in allowed_cols)
+            if candidates:
+                candidates.sort(key=lambda x: (x[3], x[1], -x[4]))
+                best_N = candidates[0][1]
+                best_H = candidates[0][2]
+            else:
+                deficit_candidates = []
+                for N in range(1, len(benches_to_use) + 1):
+                    for H in range(1, max_rows + 1):
+                        cap = 0
+                        for b in benches_to_use[:N]:
+                            b_rows_sorted = sorted(list({r for r, c in b}))
+                            allowed_rows = set(b_rows_sorted[:H])
+                            cap += sum(1 for r, c in b if r in allowed_rows)
+                        corridor_height = max_rows - H
+                        deficit_candidates.append((cap, N, H, corridor_height))
                 
-                if cap >= target_qty:
-                    excess = cap - target_qty
-                    corridor_width = max_cols - W
-                    candidates.append((cap, N, W, excess, corridor_width))
+                deficit_candidates.sort(key=lambda x: (-x[0], x[1], -x[3]))
+                best_N = deficit_candidates[0][1]
+                best_H = deficit_candidates[0][2]
+            
+            if best_N is not None and best_H is not None:
+                remaining_qty = adjusted_target_qty
+                for b in benches_to_use[:best_N]:
+                    b_cols = {c for r, c in b}
+                    physical_cols_count = len(b_cols)
                     
-        if candidates:
-            # 1. Menor excesso, 2. Menor N, 3. Maior Corredor
-            candidates.sort(key=lambda x: (x[3], x[1], -x[4]))
-            best_N = candidates[0][1]
-            best_W = candidates[0][2]
-        else:
-            # Fallback Escassez
-            deficit_candidates = []
+                    if physical_cols_count == 2 and remaining_qty % 2 != 0:
+                        remaining_qty += 1
+                        
+                    b_rows_sorted = sorted(list({r for r, c in b}))
+                    allowed_rows = set(b_rows_sorted[:best_H])
+                    allowed_cells = [cell for cell in b if cell[0] in allowed_rows]
+                    allowed_cells.sort(key=lambda x: (x[0], x[1]))
+                    
+                    take_qty = min(len(allowed_cells), remaining_qty)
+                    for cell in allowed_cells[:take_qty]:
+                        if cell not in selected_set:
+                            selected_set.add(cell)
+                            selected_list.append(cell)
+                    remaining_qty -= take_qty
+                    if remaining_qty <= 0:
+                        break
+                        
+        elif not is_mostly_vertical and horizontal_benches:
+            horizontal_benches.sort(key=lambda b: (min(c for r, c in b), min(r for r, c in b)))
+            groups = []
+            for b in horizontal_benches:
+                bc_x_0 = min(c for r, c in b)
+                placed = False
+                for grp in groups:
+                    if abs(min(c for grp_b in grp for r, c in grp_b) - bc_x_0) <= 2:
+                        grp.append(b)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([b])
+            
+            valid_groups = [grp for grp in groups if sum(len(b) for b in grp) >= adjusted_target_qty]
+            if valid_groups:
+                valid_groups.sort(key=lambda grp: min(min(c for r, c in b) for b in grp))
+                benches_to_use = valid_groups[0]
+            else:
+                benches_to_use = horizontal_benches
+                
+            max_cols = max(len({c for r, c in b}) for b in benches_to_use)
+            
+            best_N, best_W = None, None
+            candidates = []
+            
             for N in range(1, len(benches_to_use) + 1):
                 for W in range(1, max_cols + 1):
                     cap = 0
@@ -509,53 +688,90 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                         b_cols_sorted = sorted(list({c for r, c in b}))
                         allowed_cols = set(b_cols_sorted[:W])
                         cap += sum(1 for r, c in b if c in allowed_cols)
-                    corridor_width = max_cols - W
-                    deficit_candidates.append((cap, N, W, corridor_width))
-            
-            deficit_candidates.sort(key=lambda x: (-x[0], x[1], -x[3]))
-            best_N = deficit_candidates[0][1]
-            best_W = deficit_candidates[0][2]
+                    
+                    if cap >= adjusted_target_qty:
+                        excess = cap - adjusted_target_qty
+                        corridor_width = max_cols - W
+                        candidates.append((cap, N, W, excess, corridor_width))
                         
-        if best_N is not None and best_W is not None:
-            remaining_qty = target_qty
-            for b in benches_to_use[:best_N]:
-                b_cols_sorted = sorted(list({c for r, c in b}))
-                allowed_cols = set(b_cols_sorted[:best_W])
-                allowed_cells = [cell for cell in b if cell[1] in allowed_cols]
-                # --- ORDENAÇÃO DE 2 EM 2 PARA HORIZONTAIS: COLUNA PRIMEIRO ---
-                allowed_cells.sort(key=lambda x: (x[1], x[0]))
+            if candidates:
+                candidates.sort(key=lambda x: (x[3], x[1], -x[4]))
+                best_N = candidates[0][1]
+                best_W = candidates[0][2]
+            else:
+                deficit_candidates = []
+                for N in range(1, len(benches_to_use) + 1):
+                    for W in range(1, max_cols + 1):
+                        cap = 0
+                        for b in benches_to_use[:N]:
+                            b_cols_sorted = sorted(list({c for r, c in b}))
+                            allowed_cols = set(b_cols_sorted[:W])
+                            cap += sum(1 for r, c in b if c in allowed_cols)
+                        corridor_width = max_cols - W
+                        deficit_candidates.append((cap, N, W, corridor_width))
                 
-                take_qty = min(len(allowed_cells), remaining_qty)
-                selected.update(allowed_cells[:take_qty])
-                remaining_qty -= take_qty
-                if remaining_qty <= 0:
-                    break
-    # ══════════════════════════════════════════════════════════════════════════
+                deficit_candidates.sort(key=lambda x: (-x[0], x[1], -x[3]))
+                best_N = deficit_candidates[0][1]
+                best_W = deficit_candidates[0][2]
+                            
+            if best_N is not None and best_W is not None:
+                remaining_qty = adjusted_target_qty
+                for b in benches_to_use[:best_N]:
+                    b_rows = {r for r, c in b}
+                    physical_rows_count = len(b_rows)
+                    
+                    if physical_rows_count == 2 and remaining_qty % 2 != 0:
+                        remaining_qty += 1
+                        
+                    b_cols_sorted = sorted(list({c for r, c in b}))
+                    allowed_cols = set(b_cols_sorted[:best_W])
+                    allowed_cells = [cell for cell in b if cell[1] in allowed_cols]
+                    allowed_cells.sort(key=lambda x: (x[1], x[0]))
+                    
+                    take_qty = min(len(allowed_cells), remaining_qty)
+                    for cell in allowed_cells[:take_qty]:
+                        if cell not in selected_set:
+                            selected_set.add(cell)
+                            selected_list.append(cell)
+                    remaining_qty -= take_qty
+                    if remaining_qty <= 0:
+                        break
 
-    # Fallback de segurança se nada for selecionado
-    if not selected:
+    # --- FALLBACK DE SEGURANÇA SE NADA FOR SELECIONADO ---
+    if not selected_list:
         benches.sort(key=lambda b: min(b))
-        remaining_qty = target_qty
+        remaining_qty = adjusted_target_qty
         for bench in benches:
             if remaining_qty <= 0:
                 break
             bench_set = set(bench)
+            cols = {c for r, c in bench_set}
+            rows = {r for r, c in bench_set}
+            if len(rows) >= len(cols):
+                sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
+            else:
+                sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
+                
             if len(bench_set) <= remaining_qty:
-                selected.update(bench_set)
+                for cell in sorted_bench:
+                    if cell not in selected_set:
+                        selected_set.add(cell)
+                        selected_list.append(cell)
                 remaining_qty -= len(bench_set)
             else:
-                cols = {c for r, c in bench_set}
-                rows = {r for r, c in bench_set}
-                if len(rows) >= len(cols):
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[1], x[0]))
-                else:
-                    sorted_bench = sorted(list(bench_set), key=lambda x: (x[0], x[1]))
-                bench_selected = set(sorted_bench[:remaining_qty])
-                selected.update(bench_selected)
+                for cell in sorted_bench[:remaining_qty]:
+                    if cell not in selected_set:
+                        selected_set.add(cell)
+                        selected_list.append(cell)
                 remaining_qty = 0
                 break
+
+    # Truncamento cronológico cirúrgico usando estritamente a meta original (target_qty)
+    # Garante que o corte ocorra na ponta final da última bancada que estava sendo preenchida.
+    if len(selected_list) > target_qty:
+        selected_list = selected_list[:target_qty]
                 
-    return selected
+    return set(selected_list)
 
 def testar_criacao_sala_manual(
     file_path: str,
@@ -610,7 +826,7 @@ if __name__ == "__main__":
     testar_criacao_sala_manual(
         file_path="planta.xlsx",
         sheet_name="JPIII",
-        bloco_id="vazio-4",          
+        bloco_id="Bloco_4",          
         ambiente_letra="A",         
         quantidade_mesas=280,         
         output_path="planta_teste_sala.xlsx"

@@ -219,7 +219,7 @@ def find_empty_blocks(client_cells: Dict[str, Set[Cell]], ws_max_row: int, ws_ma
         c_min = min(c for r, c in zone)
         c_max = max(c for r, c in zone)
         
-        empty_blocks[f'vazio-{i+1}'] = {
+        empty_blocks[f'Bloco_{i+1}'] = {  # <--- CORRIGIDO: Modificado de "vazio-" para "Bloco_"
             'cells': set(zone),
             'size': len(zone),
             'position': (r_min, r_max, c_min, c_max),
