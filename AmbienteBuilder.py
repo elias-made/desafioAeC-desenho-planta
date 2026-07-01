@@ -166,12 +166,173 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
                 cells.extend(env['cells'])
             return cells
     return []
+
+# ══════════════════════════════════════════════════════════════════════════
+# Geração de Layout de Sala Estruturada com Circulação Interna Própria
+# ══════════════════════════════════════════════════════════════════════════
+
+def _calcular_altura_sala(W: int, N: int) -> int:
+    desks_per_row = 4 if W == 5 else 2
+    h_desks = (N + desks_per_row - 1) // desks_per_row
+    h_corridors = (h_desks - 1) // 3 if h_desks > 3 else 0
+    return h_desks + h_corridors
+
+def _encontrar_retangulo_livre(ws, env_cells: Set[Tuple[int, int]], W: int, H: int) -> Tuple[int, int]:
+    """Busca uma área retangular de tamanho W x H livre de pilares dentro do ambiente."""
+    rows = sorted(list({r for r, c in env_cells}))
+    cols = sorted(list({c for r, c in env_cells}))
+    
+    for r_start in rows:
+        if r_start + H - 1 > max(rows):
+            break
+        for c_start in cols:
+            if c_start + W - 1 > max(cols):
+                break
+                
+            valido = True
+            for r in range(r_start, r_start + H):
+                for c in range(c_start, c_start + W):
+                    if (r, c) not in env_cells or _eh_pilar_ou_coluna(ws, r, c):
+                        valido = False
+                        break
+                if not valido:
+                    break
+            if valido:
+                return r_start, c_start
+                
+    return None, None
+
+def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Set[Tuple[int, int]]:
+    """
+    Gera dinamicamente uma distribuição de N mesas dentro de env_cells em pares back-to-back,
+    inserindo corredores livres de circulação de forma responsiva sem hardcode de geometria.
+    """
+    usable = {coord for coord in env_cells if not _eh_pilar_ou_coluna(ws, coord[0], coord[1])}
+    if len(usable) < N:
+        return set(list(usable)[:N])
+        
+    rows = sorted(list({r for r, c in usable}))
+    cols = sorted(list({c for r, c in usable}))
+    
+    col_pairs = []
+    i = 0
+    while i < len(cols) - 1:
+        if cols[i+1] == cols[i] + 1:
+            col_pairs.append((cols[i], cols[i+1]))
+            i += 3  # Pula o par + 1 coluna para corredor ergonômico
+        else:
+            i += 1
+            
+    row_pairs = []
+    i = 0
+    while i < len(rows) - 1:
+        if rows[i+1] == rows[i] + 1:
+            row_pairs.append((rows[i], rows[i+1]))
+            i += 3  # Pula o par + 1 linha para corredor ergonômico
+        else:
+            i += 1
+            
+    desks = set()
+    
+    if len(col_pairs) >= len(row_pairs) and col_pairs:
+        for c1, c2 in col_pairs:
+            if len(desks) >= N:
+                break
+            common_rows = sorted([r for r in rows if (r, c1) in usable and (r, c2) in usable])
+            for r in common_rows:
+                if len(desks) >= N:
+                    break
+                desks.add((r, c1))
+                if len(desks) >= N:
+                    break
+                desks.add((r, c2))
+    elif row_pairs:
+        for r1, r2 in row_pairs:
+            if len(desks) >= N:
+                break
+            common_cols = sorted([c for c in cols if (r1, c) in usable and (r2, c) in usable])
+            for c in common_cols:
+                if len(desks) >= N:
+                    break
+                desks.add((r1, c))
+                if len(desks) >= N:
+                    break
+                desks.add((r2, c))
+    else:
+        sorted_usable = sorted(list(usable), key=lambda x: (x[1], x[0]))
+        desks = set(sorted_usable[:N])
+        
+    return desks
+
+def _gerar_layout_sala_estruturado(ws, env_cells: Set[Tuple[int, int]], N: int) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+    """
+    Gera um layout de sala estruturado de forma retangular com corredor central e de passagem.
+    Retorna: (allocated_desks, room_cells_override)
+    """
+    # 1. Tenta layout com 5 colunas de largura (central corridor, double-bench)
+    W = 5 if N > 8 else 3
+    H = _calcular_altura_sala(W, N)
+    r_start, c_start = _encontrar_retangulo_livre(ws, env_cells, W, H)
+    
+    # 2. Se não achar com 5 (ou 3), tenta o tamanho alternativo
+    if r_start is None:
+        W = 3 if W == 5 else 5
+        H = _calcular_altura_sala(W, N)
+        r_start, c_start = _encontrar_retangulo_livre(ws, env_cells, W, H)
+        
+    # 3. Se achou o retângulo livre, gera o layout estruturado interno
+    if r_start is not None:
+        desks_placed = 0
+        row_offset = 0
+        desks_set = set()
+        room_all_cells = set()
+        
+        r = r_start
+        while desks_placed < N:
+            # Insere corredor transversal de passagem a cada 3 fileiras de mesas
+            if row_offset > 0 and row_offset % 4 == 3:
+                for c in range(c_start, c_start + W):
+                    room_all_cells.add((r, c))
+                row_offset += 1
+                r += 1
+                continue
+                
+            if W == 5:
+                # Colunas de mesas: 0, 1 e 3, 4. Coluna 2 é o corredor central.
+                row_cols = [c_start, c_start + 1, c_start + 3, c_start + 4]
+            else:
+                # Colunas de mesas: 0 e 2. Coluna 1 é o corredor central.
+                row_cols = [c_start, c_start + 2]
+                
+            for c in range(c_start, c_start + W):
+                room_all_cells.add((r, c))
+                
+            for c in row_cols:
+                if desks_placed < N:
+                    desks_set.add((r, c))
+                    desks_placed += 1
+                    
+            row_offset += 1
+            r += 1
+            
+        return desks_set, room_all_cells
+        
+    # 4. Fallback absoluto se não houver espaço retangular livre: usa o gerador flexível padrão
+    allocated = _gerar_bancadas_dinamicas(ws, env_cells, N)
+    return allocated, allocated
+
+# ══════════════════════════════════════════════════════════════════════════
+# Funções de Desenho, Limpeza e Formatação
+# ══════════════════════════════════════════════════════════════════════════
+
 def separar_ambiente_e_desenhar_divisorias(
     ws, 
     env_cells: Set[Tuple[int, int]], 
     allocated_cells: Set[Tuple[int, int]], 
     border_style: str = "medium", 
-    border_color: str = "FF9900"
+    border_color: str = "FF9900",
+    reconstruir_sala: bool = False,
+    room_cells_override: Set[Tuple[int, int]] = None  # Parâmetro para controle total da área da sala
 ):
     """
     Desenha as divisórias ao redor do bloco irregular de mesas ocupadas, adicionando
@@ -189,181 +350,187 @@ def separar_ambiente_e_desenhar_divisorias(
     if not allocated:
         allocated = set(allocated_cells)
 
-    # 1. Encontra todas as mesas do ambiente para achar as bancadas ocupadas
-    all_desks_in_env = set()
-    for r, c in env_cells:
-        cell = ws.cell(row=r, column=c)
-        val_str = str(cell.value).strip().upper() if cell.value is not None else ""
-        if _eh_celula_de_mesa_local(cell) or (r, c) in allocated or val_str.startswith("N_"):
-            all_desks_in_env.add((r, c))
-
-    benches = flood_fill(all_desks_in_env)
-    target_bench_cells = set()
-    
-    # 2. Varredura inteligente de bancadas com suporte a corte de espinha
-    for bench in benches:
-        bench_set = set(bench)
-        allocated_in_bench = bench_set & allocated
+    # Se houver um override estruturado de sala, usamos a grade pré-definida diretamente
+    if room_cells_override is not None:
+        room_cells = set(room_cells_override)
+        target_bench_cells = set(allocated)
         
-        if allocated_in_bench:
-            # --- DETECÇÃO DINÂMICA DE CORTE INTENCIONAL ---
+        if reconstruir_sala:
+            fill_desk = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
+            font_desk = Font(name="Calibri", size=9)
+            for r, c in allocated:
+                cell = ws.cell(row=r, column=c)
+                cell.value = "vazio"
+                cell.fill = fill_desk
+                cell.font = font_desk
+    else:
+        # 1. Encontra as mesas para as bancadas ocupadas (modo padrão original)
+        all_desks_in_env = set()
+        for r, c in env_cells:
+            cell = ws.cell(row=r, column=c)
+            val_str = str(cell.value).strip().upper() if cell.value is not None else ""
+            if _eh_celula_de_mesa_local(cell) or (r, c) in allocated or val_str.startswith("N_"):
+                all_desks_in_env.add((r, c))
+
+        benches = flood_fill(all_desks_in_env)
+        target_bench_cells = set()
+        
+        # 2. Varredura inteligente de bancadas com suporte a corte de espinha
+        for bench in benches:
+            bench_set = set(bench)
+            allocated_in_bench = bench_set & allocated
+            
+            if allocated_in_bench:
+                b_rows = {r for r, c in bench_set}
+                b_cols = {c for r, c in bench_set}
+                physical_rows_count = len(b_rows)
+                physical_cols_count = len(b_cols)
+                
+                allocated_rows_count = len({r for r, c in allocated_in_bench})
+                allocated_cols_count = len({c for r, c in allocated_in_bench})
+                
+                corte_colunas_intencional = allocated_cols_count < physical_cols_count
+                corte_linhas_intencional = allocated_rows_count < physical_rows_count
+                
+                total_capacity = len(bench_set)
+                allocated_count = len(allocated_in_bench)
+                missing_to_complete = total_capacity - allocated_count
+                
+                excesso_potencial_global = (len(target_bench_cells) + missing_to_complete) - len(allocated)
+                max_excesso_permitido = 0 if len(allocated) >= len(allocated_cells) else 2
+                
+                if (missing_to_complete <= 2 
+                        and not corte_colunas_intencional 
+                        and not corte_linhas_intencional 
+                        and excesso_potencial_global <= max_excesso_permitido):
+                    target_bench_cells.update(bench_set)
+                else:
+                    target_bench_cells.update(allocated_in_bench)
+
+        if not target_bench_cells:
+            target_bench_cells = allocated
+
+        # 3. CONSTRUÇÃO DA ÁREA DA SALA
+        room_cells = set(target_bench_cells)
+        
+        for bench in benches:
+            bench_set = set(bench)
+            bench_allocated = bench_set & target_bench_cells
+            if not bench_allocated:
+                continue
+                
+            r0_b = min(r for r, c in bench_allocated)
+            r1_b = max(r for r, c in bench_allocated)
+            c0_b = min(c for r, c in bench_allocated)
+            c1_b = max(c for r, c in bench_allocated)
+            
             b_rows = {r for r, c in bench_set}
             b_cols = {c for r, c in bench_set}
-            physical_rows_count = len(b_rows)
-            physical_cols_count = len(b_cols)
+            is_vertical = len(b_rows) >= len(b_cols)
             
-            allocated_rows_count = len({r for r, c in allocated_in_bench})
-            allocated_cols_count = len({c for r, c in allocated_in_bench})
-            
-            corte_colunas_intencional = allocated_cols_count < physical_cols_count
-            corte_linhas_intencional = allocated_rows_count < physical_rows_count
-            
-            # --- REGRA DE PREENCHIMENTO ---
-            total_capacity = len(bench_set)
-            allocated_count = len(allocated_in_bench)
-            missing_to_complete = total_capacity - allocated_count
-            
-            # Calcula o impacto acumulado do preenchimento desta bancada no excesso global da meta
-            excesso_potencial_global = (len(target_bench_cells) + missing_to_complete) - len(allocated)
-            
-            # Se a meta já foi atingida pela seleção, não permite nenhuma sobra adicional (trava em zero)
-            max_excesso_permitido = 0 if len(allocated) >= len(allocated_cells) else 2
-            
-            if (missing_to_complete <= 2 
-                    and not corte_colunas_intencional 
-                    and not corte_linhas_intencional 
-                    and excesso_potencial_global <= max_excesso_permitido):
-                target_bench_cells.update(bench_set)
+            if is_vertical:
+                # Corredor Esquerdo
+                for r in range(r0_b, r1_b + 1):
+                    if (r, c0_b) in target_bench_cells:
+                        target_cell = (r, c0_b - 1)
+                        if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
+                            if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
+                                room_cells.add(target_cell)
+                # Corredor Direito
+                for r in range(r0_b, r1_b + 1):
+                    if (r, c1_b) in target_bench_cells:
+                        target_cell = (r, c1_b + 1)
+                        if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
+                            if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
+                                room_cells.add(target_cell)
+                # Corredor Inferior
+                left_col = c0_b - 1 if (r1_b, c0_b - 1) in room_cells else c0_b
+                right_col = c1_b + 1 if (r1_b, c1_b + 1) in room_cells else c1_b
+                
+                miolo_livre_inferior = True
+                for c in range(c0_b, c1_b + 1):
+                    if not _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c) or _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
+                        miolo_livre_inferior = False
+                        break
+                        
+                if miolo_livre_inferior:
+                    for c in range(left_col, right_col + 1):
+                        target_cell = (r1_b + 1, c)
+                        if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
+                            if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
+                                room_cells.add(target_cell)
             else:
-                target_bench_cells.update(allocated_in_bench)
+                # Corredor Superior
+                for c in range(c0_b, c1_b + 1):
+                    if (r0_b, c) in target_bench_cells:
+                        target_cell = (r0_b - 1, c)
+                        if not _tem_parede_laranja_entre(ws, r0_b, c, r0_b - 1, c):
+                            if _eh_faixa_livre(ws, env_cells, r0_b - 1, r0_b - 1, c, c):
+                                room_cells.add(target_cell)
+                # Corredor Inferior
+                for c in range(c0_b, c1_b + 1):
+                    if (r1_b, c) in target_bench_cells:
+                        target_cell = (r1_b + 1, c)
+                        if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
+                            if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
+                                room_cells.add(target_cell)
+                # Corredor Esquerdo
+                top_row = r0_b - 1 if (r0_b - 1, c0_b) in room_cells else r0_b
+                bottom_row = r1_b + 1 if (r1_b + 1, c0_b) in room_cells else r1_b
+                
+                miolo_livre_esquerdo = True
+                for r in range(r0_b, r1_b + 1):
+                    if not _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1) or _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
+                        miolo_livre_esquerdo = False
+                        break
+                        
+                if miolo_livre_esquerdo:
+                    for r in range(top_row, bottom_row + 1):
+                        target_cell = (r, c0_b - 1)
+                        if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
+                            if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
+                                room_cells.add(target_cell)
+                                
+                # Corredor Direito
+                top_row = r0_b - 1 if (r0_b - 1, c1_b) in room_cells else r0_b
+                bottom_row = r1_b + 1 if (r1_b + 1, c1_b) in room_cells else r1_b
+                
+                miolo_livre_direito = True
+                for r in range(r0_b, r1_b + 1):
+                    if not _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1) or _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
+                        miolo_livre_direito = False
+                        break
+                        
+                    if miolo_livre_direito:
+                        for r in range(top_row, bottom_row + 1):
+                            target_cell = (r, c1_b + 1)
+                            if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
+                                if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
+                                    room_cells.add(target_cell)
 
-    if not target_bench_cells:
-        target_bench_cells = allocated
-
-    # 3. CONSTRUÇÃO DA ÁREA DA SALA (união de mesas + corredores ergonômicos correspondentes limitados ao ambiente base)
-    room_cells = set(target_bench_cells)
-    
-    for bench in benches:
-        bench_set = set(bench)
-        bench_allocated = bench_set & target_bench_cells
-        if not bench_allocated:
-            continue
-            
-        r0_b = min(r for r, c in bench_allocated)
-        r1_b = max(r for r, c in bench_allocated)
-        c0_b = min(c for r, c in bench_allocated)
-        c1_b = max(c for r, c in bench_allocated)
-        
-        # Determina a orientação física desta bancada específica
-        b_rows = {r for r, c in bench_set}
-        b_cols = {c for r, c in bench_set}
-        is_vertical = len(b_rows) >= len(b_cols)
-        
-        if is_vertical:
-            # Corredor Esquerdo: expande se não houver parede laranja no caminho
-            for r in range(r0_b, r1_b + 1):
-                if (r, c0_b) in target_bench_cells:
-                    target_cell = (r, c0_b - 1)
-                    if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
-                        if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
-                            room_cells.add(target_cell)
-            # Corredor Direito: expande se não houver parede laranja no caminho
-            for r in range(r0_b, r1_b + 1):
-                if (r, c1_b) in target_bench_cells:
-                    target_cell = (r, c1_b + 1)
-                    if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
-                        if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
-                            room_cells.add(target_cell)
-            # Corredor Inferior (Unificador/Conector de Escape feito célula a célula)
-            left_col = c0_b - 1 if (r1_b, c0_b - 1) in room_cells else c0_b
-            right_col = c1_b + 1 if (r1_b, c1_b + 1) in room_cells else c1_b
-            
-            # Validação dinâmica de miolo para conector horizontal inferior
-            miolo_livre_inferior = True
-            for c in range(c0_b, c1_b + 1):
-                if not _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c) or _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
-                    miolo_livre_inferior = False
-                    break
-                    
-            if miolo_livre_inferior:
-                for c in range(left_col, right_col + 1):
-                    target_cell = (r1_b + 1, c)
-                    if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
-                        if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
-                            room_cells.add(target_cell)
-        else:
-            # Corredor Superior (Egress): expande se não houver parede laranja no caminho
-            for c in range(c0_b, c1_b + 1):
-                if (r0_b, c) in target_bench_cells:
-                    target_cell = (r0_b - 1, c)
-                    if not _tem_parede_laranja_entre(ws, r0_b, c, r0_b - 1, c):
-                        if _eh_faixa_livre(ws, env_cells, r0_b - 1, r0_b - 1, c, c):
-                            room_cells.add(target_cell)
-            # Corredor Inferior (Egress): expande se não houver parede laranja no caminho
-            for c in range(c0_b, c1_b + 1):
-                if (r1_b, c) in target_bench_cells:
-                    target_cell = (r1_b + 1, c)
-                    if not _tem_parede_laranja_entre(ws, r1_b, c, r1_b + 1, c):
-                        if _eh_faixa_livre(ws, env_cells, r1_b + 1, r1_b + 1, c, c):
-                            room_cells.add(target_cell)
-            # Corredor Esquerdo (Unificador/Conector feito célula a célula)
-            top_row = r0_b - 1 if (r0_b - 1, c0_b) in room_cells else r0_b
-            bottom_row = r1_b + 1 if (r1_b + 1, c0_b) in room_cells else r1_b
-            
-            # Validação dinâmica de miolo para conector vertical esquerdo
-            miolo_livre_esquerdo = True
-            for r in range(r0_b, r1_b + 1):
-                if not _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1) or _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
-                    miolo_livre_esquerdo = False
-                    break
-                    
-            if miolo_livre_esquerdo:
-                for r in range(top_row, bottom_row + 1):
-                    target_cell = (r, c0_b - 1)
-                    if not _tem_parede_laranja_entre(ws, r, c0_b, r, c0_b - 1):
-                        if _eh_faixa_livre(ws, env_cells, r, r, c0_b - 1, c0_b - 1):
-                            room_cells.add(target_cell)
-                            
-            # Corredor Direito (Unificador/Conector feito célula a célula - independente)
-            top_row = r0_b - 1 if (r0_b - 1, c1_b) in room_cells else r0_b
-            bottom_row = r1_b + 1 if (r1_b + 1, c1_b) in room_cells else r1_b
-            
-            # Validação dinâmica de miolo para conector vertical direito
-            miolo_livre_direito = True
-            for r in range(r0_b, r1_b + 1):
-                if not _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1) or _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
-                    miolo_livre_direito = False
-                    break
-                    
-            if miolo_livre_direito:
-                for r in range(top_row, bottom_row + 1):
-                    target_cell = (r, c1_b + 1)
-                    if not _tem_parede_laranja_entre(ws, r, c1_b, r, c1_b + 1):
-                        if _eh_faixa_livre(ws, env_cells, r, r, c1_b + 1, c1_b + 1):
-                            room_cells.add(target_cell)
-
-    # 3.5. PONTE DE CORREDOR VERTICAL (UNIFICAÇÃO DE ILHAS DE SALAS)
-    corridor_columns = {c for r, c in (room_cells - target_bench_cells)}
-    for col in sorted(list(corridor_columns)):
-        rows_in_col = sorted(list({r for r, c in room_cells if c == col}))
-        if len(rows_in_col) > 1:
-            for i in range(len(rows_in_col) - 1):
-                r_start = rows_in_col[i]
-                r_end = rows_in_col[i + 1]
-                if r_end - r_start > 1:
-                    gap_rows = range(r_start + 1, r_end)
-                    all_gap_free = True
-                    for gr in gap_rows:
-                        target_cell = (gr, col)
-                        if _tem_parede_laranja_entre(ws, gr - 1, col, gr, col) or not _eh_faixa_livre(ws, env_cells, gr, gr, col, col):
-                            all_gap_free = False
-                            break
-                    if all_gap_free:
+        # 3.5. PONTE DE CORREDOR VERTICAL
+        corridor_columns = {c for r, c in (room_cells - target_bench_cells)}
+        for col in sorted(list(corridor_columns)):
+            rows_in_col = sorted(list({r for r, c in room_cells if c == col}))
+            if len(rows_in_col) > 1:
+                for i in range(len(rows_in_col) - 1):
+                    r_start = rows_in_col[i]
+                    r_end = rows_in_col[i + 1]
+                    if r_end - r_start > 1:
+                        gap_rows = range(r_start + 1, r_end)
+                        all_gap_free = True
                         for gr in gap_rows:
-                            room_cells.add((gr, col))
+                            target_cell = (gr, col)
+                            if _tem_parede_laranja_entre(ws, gr - 1, col, gr, col) or not _eh_faixa_livre(ws, env_cells, gr, gr, col, col):
+                                all_gap_free = False
+                                break
+                        if all_gap_free:
+                            for gr in gap_rows:
+                                room_cells.add((gr, col))
 
-    # 4. INSERÇÃO DA CATRACA (CT) ÚNICA NO ESPAÇO DE CORREDOR MAIS BAIXO DO AMBIENTE UNIFICADO
+    # 4. INSERÇÃO DA CATRACA (CT) ÚNICA
     corridor_cells = room_cells - target_bench_cells
+    cell_ct_coord = None
     if corridor_cells:
         max_r = max(r for r, c in room_cells)
         bottom_corridors = [cell for cell in corridor_cells if cell[0] == max_r]
@@ -387,19 +554,23 @@ def separar_ambiente_e_desenhar_divisorias(
         cell_ct.fill = fill_ct
         cell_ct.font = font_ct
 
-    # 5. DESENHO DAS DIVISÓRIAS (CONTORNO DA SALA CÉLULA A CÉLULA)
-    # Sempre desenha as bordas limitantes do contorno da sala, independente de pilares vizinhos.
+    # 4.5. Limpa os corredores internos da sala criada de forma isolada
+    if reconstruir_sala:
+        for r, c in room_cells:
+            if (r, c) not in target_bench_cells and (r, c) != cell_ct_coord:
+                if not _eh_pilar_ou_coluna(ws, r, c):
+                    cell = ws.cell(row=r, column=c)
+                    cell.value = ""
+                    cell.fill = PatternFill(fill_type=None)
+
+    # 5. DESENHO DAS DIVISÓRIAS
     for r, c in room_cells:
-        # Topo
         if (r - 1, c) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'top', side_style)
-        # Base
         if (r + 1, c) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'bottom', side_style)
-        # Esquerda
         if (r, c - 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'left', side_style)
-        # Direita
         if (r, c + 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'right', side_style)
 
@@ -779,13 +950,14 @@ def testar_criacao_sala_manual(
     bloco_id: str,
     ambiente_letra: str,
     quantidade_mesas: int,
+    quantidade_mesas_sala: int = None,  # Opcional para ativação da sala interna
     output_path: str = "planta_teste_sala.xlsx",
     border_style: str = "medium",
     border_color: str = "FF9900"
 ):
     """
-    Carrega a planilha, seleciona as mesas de forma contígua e desenha as divisórias
-    de contorno ao redor de todas as bancadas completas ocupadas, sem alterar valores ou estilos.
+    Carrega a planilha, seleciona a equipe principal e, caso solicitado, cria uma
+    sala fechada estruturada internamente com corredor de circulação próprio.
     """
     print(f"\n[INICIANDO TESTE MANUAL] Bloco: {bloco_id} | Ambiente: {ambiente_letra} | PAs Solicitadas: {quantidade_mesas}")
     
@@ -803,21 +975,39 @@ def testar_criacao_sala_manual(
         print(f"Erro: Não foi possível localizar células para o ambiente '{bloco_id}-{ambiente_letra}'.")
         return
 
-    # 1. Seleciona estritamente a quantidade de mesas solicitada contiguamente
-    allocated_cells = _selecionar_mesas_contiguas(env_cells, ws, quantidade_mesas)
+    # 1. Aloca e desenha as divisórias da equipe principal (120 mesas normais intactas)
+    allocated_ambiente = _selecionar_mesas_contiguas(env_cells, ws, quantidade_mesas)
     
-    if not allocated_cells:
+    if not allocated_ambiente:
         print("Erro: Nenhuma mesa utilizável encontrada nesse ambiente.")
         return
 
-    # 2. Desenha as divisórias de contorno considerando a ocupação dinâmica no ambiente base (env_cells)
     separar_ambiente_e_desenhar_divisorias(
         ws=ws, 
         env_cells=env_cells, 
-        allocated_cells=allocated_cells,
+        allocated_cells=allocated_ambiente,
         border_style=border_style, 
-        border_color=border_color
+        border_color=border_color,
+        reconstruir_sala=False
     )
+
+    # 2. Se solicitada a sala, gera o layout estruturado interno e desenha no contorno correspondente
+    if quantidade_mesas_sala is not None:
+        print(f"🛠️ Criando Sala Fechada Estruturada de {quantidade_mesas_sala} mesas dentro do ambiente...")
+        
+        # Gera o layout da sala estruturada (mesas e sua circulação interna dedicada)
+        allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(ws, env_cells, quantidade_mesas_sala)
+        
+        # Reconstrói as mesas e limpa corredores apenas no perímetro override da sala fechada
+        separar_ambiente_e_desenhar_divisorias(
+            ws=ws, 
+            env_cells=env_cells, 
+            allocated_cells=allocated_sala,
+            border_style=border_style, 
+            border_color=border_color,
+            reconstruir_sala=True,
+            room_cells_override=room_cells_override
+        )
 
     wb.save(output_path)
     print(f"✓ Teste concluído com sucesso! Resultado salvo em: '{output_path}'")
@@ -826,8 +1016,9 @@ if __name__ == "__main__":
     testar_criacao_sala_manual(
         file_path="planta.xlsx",
         sheet_name="JPIII",
-        bloco_id="Bloco_4",          
+        bloco_id="Bloco_2",          
         ambiente_letra="A",         
-        quantidade_mesas=280,         
+        quantidade_mesas=120, 
+        quantidade_mesas_sala=10,  # Exemplo de criação de sala dinâmica para 10 mesas com corredor
         output_path="planta_teste_sala.xlsx"
     )
