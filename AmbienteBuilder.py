@@ -6,8 +6,17 @@ from typing import List, Set, Tuple
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import MergedCell
 
 from ScannerPremissas import scan_orange_context
+
+
+def _eh_celula_mesclada(ws, r: int, c: int) -> bool:
+    """Retorna True se a célula (r, c) faz parte de um range mesclado e não pode ser
+    escrita individualmente (openpyxl só permite escrever na âncora/topo-esquerda)."""
+    if r < 1 or r > ws.max_row or c < 1 or c > ws.max_column:
+        return False
+    return isinstance(ws.cell(row=r, column=c), MergedCell)
 
 # ══════════════════════════════════════════════════════════════════════════
 # Funções de Fluxo, Contornos e Divisórias Dinâmicas (Sem Hardcode)
@@ -137,7 +146,6 @@ def _eh_faixa_livre(ws, env_cells: Set[Tuple[int, int]], r0, r1, c0, c1) -> bool
                     return False
     return True
 
-# Modifique a assinatura de get_env_cells para suportar o fallback inteligente de letras
 def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
     """Identifica as coordenadas de células de forma tolerante a alucinações de letras."""
     if not block_id_str or not env_letter:
@@ -150,7 +158,6 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
         block = macro_blocks[block_idx - 1]
         block_envs = {e['id'].upper(): e for e in block.get('ambientes', [])}
         
-        # Fallback se o LLM pedir B mas só existir o ambiente A na planta física
         target_env = env_letter.upper()
         if target_env not in block_envs and len(block_envs) == 1:
             target_env = list(block_envs.keys())[0]
@@ -177,36 +184,248 @@ def _calcular_altura_sala(W: int, N: int) -> int:
     h_corridors = (h_desks - 1) // 3 if h_desks > 3 else 0
     return h_desks + h_corridors
 
-def _encontrar_retangulo_livre(ws, env_cells: Set[Tuple[int, int]], W: int, H: int) -> Tuple[int, int]:
-    """Busca uma área retangular de tamanho W x H livre de pilares dentro do ambiente."""
+def _celulas_contorno_do_ambiente(ws, env_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+    """
+    Retorna as células do anel de contorno (parede laranja) do ambiente que são piso
+    utilizável, e não pilares sólidos nem mesas/rótulos de outros ambientes.
+
+    O scanner (get_interior_cells) remove do env_cells todo o anel de células que carrega
+    a borda laranja do contorno, pois elas entram em border_cells. Isso encolhe o ambiente
+    em 1 célula em toda a volta e faz com que qualquer sala nova pare a 1 célula da parede
+    real. Aqui recuperamos justamente essas células de perímetro (vazias, com borda laranja,
+    sem preenchimento sólido) para que a sala possa assentar rente à parede do ambiente.
+    """
+    from ScannerPremissas import cell_has_orange_fill, cell_has_orange_border
+    extra: Set[Tuple[int, int]] = set()
+    # Inclui as 8 direções (ortogonais + diagonais). As diagonais são essenciais para
+    # recuperar as QUINAS do contorno (ex.: a célula de canto que tem parede laranja em cima
+    # e à esquerda, mas que só toca o interior na diagonal). Sem elas, o medidor de gap trata
+    # a coluna/linha da parede como inválida e a sala para 1 célula antes da parede real.
+    for (r, c) in env_cells:
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1),
+                       (-1, -1), (-1, 1), (1, -1), (1, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in env_cells:
+                continue
+            if nr < 1 or nr > ws.max_row or nc < 1 or nc > ws.max_column:
+                continue
+            cell = ws.cell(row=nr, column=nc)
+            # Células mescladas (paredes desenhadas como range) não podem ser escritas/estilizadas
+            # individualmente pelo openpyxl; não as puxamos para a sala.
+            if isinstance(cell, MergedCell):
+                continue
+            # Pilar/bloco sólido laranja não é piso: nunca ocupar
+            if cell_has_orange_fill(cell):
+                continue
+            # Não engolir mesas nem rótulos (SALA, CT, etc.) de outros ambientes
+            val = str(cell.value).strip().upper() if cell.value is not None else ""
+            if val:
+                continue
+            # Só recupera a célula se ela é de fato o contorno laranja do ambiente
+            if cell_has_orange_border(cell):
+                extra.add((nr, nc))
+    return extra
+
+def _eh_celula_valida_para_sala(ws, r: int, c: int, env_cells: Set[Tuple[int, int]]) -> bool:
+    """Verifica se a célula está dentro do conjunto real do bloco, evitando pilares
+    e outras salas preexistentes, mas permitindo colar nas bordas externas de contorno."""
+    if (r, c) not in env_cells:
+        return False
+        
+    if _eh_pilar_ou_coluna(ws, r, c):
+        return False
+        
+    # Permite células com borda laranja do próprio contorno, evitando apenas preenchimentos sólidos (pilares)
+    from ScannerPremissas import cell_has_orange_fill
+    cell = ws.cell(row=r, column=c)
+    if cell_has_orange_fill(cell):
+        return False
+        
+    # Evita textos como SALA, COWORKING, etc. que indiquem outras salas
+    val_str = str(cell.value).strip().upper() if cell.value is not None else ""
+    if val_str in ('SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS'):
+        return False
+        
+    return True
+
+def _contar_gap_borda(ws, env_cells: Set[Tuple[int, int]], r_start: int, r_end: int, c_start: int, c_end: int, direcao: str) -> int:
+    """
+    Conta quantas células contíguas e válidas (dentro do ambiente, sem pilares/paredes/outras salas)
+    existem a partir da borda do retângulo candidato, na direção especificada, até encontrar
+    a primeira célula inválida (barreira real).
+
+    Isso mede a distância física real até a próxima barreira, em vez de usar min()/max() sobre
+    todo o ambiente (que confundia corredores distantes e outras alas com a "borda" do bloco).
+    Corredores vazios contam como válidos (fazem parte de env_cells), então o gap avança
+    naturalmente por eles até topar em algo físico de fato.
+    """
+    gap = 0
+    limite = 3  # não precisamos contar além do limiar usado na validação (>=3 já é aceitável)
+    if direcao in ('left', 'right'):
+        c = c_start if direcao == 'left' else c_end
+        step = -1 if direcao == 'left' else 1
+        while gap < limite:
+            c += step
+            if not all(_eh_celula_valida_para_sala(ws, r, c, env_cells) for r in range(r_start, r_end + 1)):
+                break
+            gap += 1
+    else:
+        r = r_start if direcao == 'top' else r_end
+        step = -1 if direcao == 'top' else 1
+        while gap < limite:
+            r += step
+            if not all(_eh_celula_valida_para_sala(ws, r, c, env_cells) for c in range(c_start, c_end + 1)):
+                break
+            gap += 1
+    return gap
+
+def _remocao_preserva_conectividade(env_cells: Set[Tuple[int, int]], rect_cells: Set[Tuple[int, int]]) -> bool:
+    """
+    Verifica se, ao remover o retângulo candidato (rect_cells) do ambiente, o espaço restante
+    continua totalmente conectado. Isso evita que a sala seja posicionada de forma a cortar
+    o ambiente em dois pedaços, isolando mesas do outro lado sem rota de saída até a catraca.
+
+    Se o restante ficar dividido em mais de um componente conectado, o retângulo é rejeitado,
+    mesmo que geometricamente ele fosse válido de outra forma.
+    """
+    from BlockMapper import flood_fill
+
+    restante = env_cells - rect_cells
+    if not restante:
+        return True  # Não sobrou nada para verificar (a sala tomou o ambiente inteiro)
+
+    componentes = flood_fill(restante)
+    return len(componentes) <= 1
+
+def _celula_eh_corredor_circulacao(ws, env_cells: Set[Tuple[int, int]], r: int, c: int) -> bool:
+    """
+    True se a célula (r, c) é um corredor de circulação real: está dentro do ambiente,
+    é uma faixa livre (sem mesa/barreira/catraca) e NÃO é uma célula de parede-contorno
+    (borda ou preenchimento laranja). Isso distingue corredor de circulação de uma parede
+    do ambiente, já que o env aumentado inclui o anel de contorno.
+    """
+    if (r, c) not in env_cells:
+        return False
+    from ScannerPremissas import cell_has_orange_border, cell_has_orange_fill
+    cell = ws.cell(row=r, column=c)
+    if cell_has_orange_border(cell) or cell_has_orange_fill(cell):
+        return False
+    return _eh_faixa_livre(ws, env_cells, r, r, c, c)
+
+def _sala_conecta_corredor(ws, env_cells: Set[Tuple[int, int]], r_start: int, r_end: int, c_start: int, c_end: int) -> bool:
+    """
+    True se pelo menos um lado do retângulo da sala é adjacente a um corredor de circulação,
+    sem parede laranja entre a sala e esse corredor. Garante que a sala tenha uma porta viável
+    (mesmo que a porta não seja desenhada nem marcada) ligada à circulação do ambiente.
+    """
+    # Topo e base
+    for c in range(c_start, c_end + 1):
+        if _celula_eh_corredor_circulacao(ws, env_cells, r_start - 1, c) and not _tem_parede_laranja_entre(ws, r_start, c, r_start - 1, c):
+            return True
+        if _celula_eh_corredor_circulacao(ws, env_cells, r_end + 1, c) and not _tem_parede_laranja_entre(ws, r_end, c, r_end + 1, c):
+            return True
+    # Esquerda e direita
+    for r in range(r_start, r_end + 1):
+        if _celula_eh_corredor_circulacao(ws, env_cells, r, c_start - 1) and not _tem_parede_laranja_entre(ws, r, c_start, r, c_start - 1):
+            return True
+        if _celula_eh_corredor_circulacao(ws, env_cells, r, c_end + 1) and not _tem_parede_laranja_entre(ws, r, c_end, r, c_end + 1):
+            return True
+    return False
+
+def _encontrar_melhor_retangulo_sala(ws, env_cells: Set[Tuple[int, int]], W: int, H: int) -> Tuple[int, int, Set[Tuple[int, int]]]:
+    """
+    Encontra o melhor retângulo W x H para a sala dentro do bloco,
+    priorizando encostar nas paredes externas e minimizar a sobreposição de mesas existentes,
+    sem nunca invadir salas preexistentes ou deixar mesas presas nas laterais de forma irregular.
+    """
+    if not env_cells:
+        return None, None, set()
+        
+    r_max = max(r for r, c in env_cells)
+    c_max = max(c for r, c in env_cells)
+    
     rows = sorted(list({r for r, c in env_cells}))
     cols = sorted(list({c for r, c in env_cells}))
     
+    candidates = []
+    
     for r_start in rows:
-        if r_start + H - 1 > max(rows):
+        if r_start + H - 1 > r_max:
             break
         for c_start in cols:
-            if c_start + W - 1 > max(cols):
+            if c_start + W - 1 > c_max:
                 break
                 
             valido = True
-            for r in range(r_start, r_start + H):
-                for c in range(c_start, c_start + W):
-                    if (r, c) not in env_cells or _eh_pilar_ou_coluna(ws, r, c):
-                        valido = False
-                        break
-                if not valido:
-                    break
-            if valido:
-                return r_start, c_start
+            rect_cells = set()
+            desks_destroyed = 0
+            
+            r_end = r_start + H - 1
+            c_end = c_start + W - 1
+            
+            # Impedir recuos estreitos de 1 ou 2 células medindo a distância REAL até a próxima
+            # barreira física, célula a célula, a partir de cada lado do retângulo candidato.
+            # gap == 0 significa que já encosta na parede/limite (ótimo).
+            # gap >= 3 significa que há espaço suficiente para um corredor de circulação (aceitável).
+            # 0 < gap < 3 é o caso problemático: sobraria uma faixa inutilizável -> inválido.
+            gap_left = _contar_gap_borda(ws, env_cells, r_start, r_end, c_start, c_end, 'left')
+            if 0 < gap_left < 3:
+                valido = False
+            gap_right = _contar_gap_borda(ws, env_cells, r_start, r_end, c_start, c_end, 'right') if valido else 0
+            if valido and 0 < gap_right < 3:
+                valido = False
+            gap_top = _contar_gap_borda(ws, env_cells, r_start, r_end, c_start, c_end, 'top') if valido else 0
+            if valido and 0 < gap_top < 3:
+                valido = False
+            gap_bottom = _contar_gap_borda(ws, env_cells, r_start, r_end, c_start, c_end, 'bottom') if valido else 0
+            if valido and 0 < gap_bottom < 3:
+                valido = False
                 
-    return None, None
+            if valido:
+                for r in range(r_start, r_start + H):
+                    for c in range(c_start, c_start + W):
+                        if not _eh_celula_valida_para_sala(ws, r, c, env_cells):
+                            valido = False
+                            break
+                        rect_cells.add((r, c))
+                        cell = ws.cell(row=r, column=c)
+                        if _eh_celula_de_mesa_local(cell):
+                            desks_destroyed += 1
+                    if not valido:
+                        break
+            
+            # Verifica se retirar este retângulo não isola mesas do restante do ambiente
+            # (não pode deixar mesas presas sem rota de saída para a catraca/corredor principal).
+            if valido and not _remocao_preserva_conectividade(env_cells, rect_cells):
+                valido = False
+                        
+            if valido:
+                touching_sides = 0
+                if any(not _eh_celula_valida_para_sala(ws, r_start - 1, c, env_cells) for c in range(c_start, c_start + W)):
+                    touching_sides += 1
+                if any(not _eh_celula_valida_para_sala(ws, r_start + H, c, env_cells) for c in range(c_start, c_start + W)):
+                    touching_sides += 1
+                if any(not _eh_celula_valida_para_sala(ws, r, c_start - 1, env_cells) for r in range(r_start, r_start + H)):
+                    touching_sides += 1
+                if any(not _eh_celula_valida_para_sala(ws, r, c_start + W, env_cells) for r in range(r_start, r_start + H)):
+                    touching_sides += 1
+
+                # Preferência principal: a sala deve estar ligada a um corredor de circulação
+                # do ambiente (porta única viável), mesmo que a porta não seja desenhada.
+                conecta = 1 if _sala_conecta_corredor(ws, env_cells, r_start, r_end, c_start, c_end) else 0
+
+                candidates.append((conecta, touching_sides, desks_destroyed, r_start, c_start, rect_cells))
+                
+    if candidates:
+        # 1º liga em corredor; 2º encosta em mais paredes; 3º destrói menos mesas; depois ordem estável
+        candidates.sort(key=lambda x: (-x[0], -x[1], x[2], x[3], x[4]))
+        best = candidates[0]
+        return best[3], best[4], best[5]
+        
+    return None, None, set()
 
 def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Set[Tuple[int, int]]:
-    """
-    Gera dinamicamente uma distribuição de N mesas dentro de env_cells em pares back-to-back,
-    inserindo corredores livres de circulação de forma responsiva sem hardcode de geometria.
-    """
+    """Gera bancadas simples caso falhe a estruturação retangular ideal."""
     usable = {coord for coord in env_cells if not _eh_pilar_ou_coluna(ws, coord[0], coord[1])}
     if len(usable) < N:
         return set(list(usable)[:N])
@@ -219,7 +438,7 @@ def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Se
     while i < len(cols) - 1:
         if cols[i+1] == cols[i] + 1:
             col_pairs.append((cols[i], cols[i+1]))
-            i += 3  # Pula o par + 1 coluna para corredor ergonômico
+            i += 3
         else:
             i += 1
             
@@ -228,7 +447,7 @@ def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Se
     while i < len(rows) - 1:
         if rows[i+1] == rows[i] + 1:
             row_pairs.append((rows[i], rows[i+1]))
-            i += 3  # Pula o par + 1 linha para corredor ergonômico
+            i += 3
         else:
             i += 1
             
@@ -266,58 +485,79 @@ def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Se
 
 def _gerar_layout_sala_estruturado(ws, env_cells: Set[Tuple[int, int]], N: int) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
     """
-    Gera um layout de sala estruturado de forma retangular com corredor central e de passagem.
-    Retorna: (allocated_desks, room_cells_override)
+    Gera um layout de sala estruturado e ADAPTATIVO à quantidade de mesas (N), com
+    circulação interna em "U" conectada (um único componente de circulação).
+
+    Regras atendidas:
+      - Mesas em bancadas de 2 (back-to-back), com corredor de circulação dos dois lados
+        das bancadas (não prende operador contra a parede).
+      - Os dois corredores laterais são unidos por uma faixa livre numa das pontas,
+        formando uma circulação única (a sala é "pensada em 1 porta"). A porta em si não
+        é desenhada nem marcada; a sala pode ser só parede em volta.
+      - A sala é dimensionada para caber EXATAMENTE N mesas mais essa circulação.
+      - O posicionamento (via _encontrar_melhor_retangulo_sala) prioriza encostar a sala
+        num corredor de circulação do ambiente.
+
+    Geometria:
+      - Vertical: 4 colunas [corredor | mesa | mesa | corredor] x (ceil(N/2) + 1) linhas,
+        onde a última linha é a faixa livre que liga os corredores esquerdo e direito.
+      - Horizontal: 4 linhas [corredor / mesa / mesa / corredor] x (ceil(N/2) + 1) colunas,
+        onde a última coluna é a faixa livre que liga os corredores superior e inferior.
     """
-    # 1. Tenta layout com 5 colunas de largura (central corridor, double-bench)
-    W = 5 if N > 8 else 3
-    H = _calcular_altura_sala(W, N)
-    r_start, c_start = _encontrar_retangulo_livre(ws, env_cells, W, H)
-    
-    # 2. Se não achar com 5 (ou 3), tenta o tamanho alternativo
-    if r_start is None:
-        W = 3 if W == 5 else 5
-        H = _calcular_altura_sala(W, N)
-        r_start, c_start = _encontrar_retangulo_livre(ws, env_cells, W, H)
-        
-    # 3. Se achou o retângulo livre, gera o layout estruturado interno
-    if r_start is not None:
-        desks_placed = 0
-        row_offset = 0
+    # Aumenta o ambiente com o anel de contorno (parede laranja) para que a sala
+    # possa assentar rente à parede real, e não parar a 1 célula dela.
+    env_cells = set(env_cells) | _celulas_contorno_do_ambiente(ws, env_cells)
+
+    if N <= 0:
+        return set(), set()
+
+    linhas_mesas = (N + 1) // 2  # ceil(N/2): nº de linhas (vertical) / colunas (horizontal) de bancada
+
+    # Vertical: 4 colunas x (linhas_mesas + 1 faixa de ligação)
+    W_v, H_v = 4, linhas_mesas + 1
+    r_v, c_v, _rect_v = _encontrar_melhor_retangulo_sala(ws, env_cells, W_v, H_v)
+
+    # Horizontal: (linhas_mesas + 1 faixa de ligação) colunas x 4 linhas
+    H_h, W_h = 4, linhas_mesas + 1
+    r_h, c_h, _rect_h = _encontrar_melhor_retangulo_sala(ws, env_cells, W_h, H_h)
+
+    opcoes = []
+    if r_v is not None:
+        opcoes.append(("v", W_v * H_v, r_v, c_v, W_v, H_v))
+    if r_h is not None:
+        opcoes.append(("h", W_h * H_h, r_h, c_h, W_h, H_h))
+
+    if opcoes:
+        opcoes.sort(key=lambda x: x[1])  # mais compacto primeiro
+        layout, _area, r_start, c_start, W, H = opcoes[0]
+
+        room_all_cells = {(r, c)
+                          for r in range(r_start, r_start + H)
+                          for c in range(c_start, c_start + W)}
+
         desks_set = set()
-        room_all_cells = set()
-        
-        r = r_start
-        while desks_placed < N:
-            # Insere corredor transversal de passagem a cada 3 fileiras de mesas
-            if row_offset > 0 and row_offset % 4 == 3:
-                for c in range(c_start, c_start + W):
-                    room_all_cells.add((r, c))
-                row_offset += 1
-                r += 1
-                continue
-                
-            if W == 5:
-                # Colunas de mesas: 0, 1 e 3, 4. Coluna 2 é o corredor central.
-                row_cols = [c_start, c_start + 1, c_start + 3, c_start + 4]
-            else:
-                # Colunas de mesas: 0 e 2. Coluna 1 é o corredor central.
-                row_cols = [c_start, c_start + 2]
-                
-            for c in range(c_start, c_start + W):
-                room_all_cells.add((r, c))
-                
-            for c in row_cols:
-                if desks_placed < N:
-                    desks_set.add((r, c))
-                    desks_placed += 1
-                    
-            row_offset += 1
-            r += 1
-            
-        return desks_set, room_all_cells
-        
-    # 4. Fallback absoluto se não houver espaço retangular livre: usa o gerador flexível padrão
+        placed = 0
+        if layout == "v":
+            # Mesas nas 2 colunas centrais; última linha fica livre (faixa de ligação em U)
+            desk_cols = (c_start + 1, c_start + 2)
+            for r in range(r_start, r_start + H - 1):
+                for c in desk_cols:
+                    if placed < N:
+                        desks_set.add((r, c))
+                        placed += 1
+        else:
+            # Mesas nas 2 linhas centrais; última coluna fica livre (faixa de ligação em U)
+            desk_rows = (r_start + 1, r_start + 2)
+            for c in range(c_start, c_start + W - 1):
+                for r in desk_rows:
+                    if placed < N:
+                        desks_set.add((r, c))
+                        placed += 1
+
+        if placed >= N:
+            return desks_set, room_all_cells
+
+    # Fallback: não coube o retângulo estruturado -> bancadas dinâmicas simples
     allocated = _gerar_bancadas_dinamicas(ws, env_cells, N)
     return allocated, allocated
 
@@ -350,15 +590,23 @@ def separar_ambiente_e_desenhar_divisorias(
     if not allocated:
         allocated = set(allocated_cells)
 
-    # Se houver um override estruturado de sala, usamos a grade pré-definida diretamente
+    # Se houver um override estruturado de sala, usamos a grade pré-definida diretamente.
+    # A sala é um espaço totalmente controlado (definido por room_cells_override): as mesas
+    # NÃO devem ser filtradas pelo env_cells encolhido do scanner, senão as PAs que encostam
+    # na parede (recuperadas via anel de contorno) seriam descartadas e a sala ficaria com
+    # menos mesas do que o solicitado.
     if room_cells_override is not None:
         room_cells = set(room_cells_override)
-        target_bench_cells = set(allocated)
+        target_bench_cells = set(allocated_cells) & room_cells
+        if not target_bench_cells:
+            target_bench_cells = set(allocated_cells)
         
         if reconstruir_sala:
             fill_desk = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
             font_desk = Font(name="Calibri", size=9)
-            for r, c in allocated:
+            for r, c in target_bench_cells:
+                if _eh_celula_mesclada(ws, r, c):
+                    continue
                 cell = ws.cell(row=r, column=c)
                 cell.value = "vazio"
                 cell.fill = fill_desk
@@ -375,7 +623,6 @@ def separar_ambiente_e_desenhar_divisorias(
         benches = flood_fill(all_desks_in_env)
         target_bench_cells = set()
         
-        # 2. Varredura inteligente de bancadas com suporte a corte de espinha
         for bench in benches:
             bench_set = set(bench)
             allocated_in_bench = bench_set & allocated
@@ -410,7 +657,6 @@ def separar_ambiente_e_desenhar_divisorias(
         if not target_bench_cells:
             target_bench_cells = allocated
 
-        # 3. CONSTRUÇÃO DA ÁREA DA SALA
         room_cells = set(target_bench_cells)
         
         for bench in benches:
@@ -514,10 +760,10 @@ def separar_ambiente_e_desenhar_divisorias(
             rows_in_col = sorted(list({r for r, c in room_cells if c == col}))
             if len(rows_in_col) > 1:
                 for i in range(len(rows_in_col) - 1):
-                    r_start = rows_in_col[i]
-                    r_end = rows_in_col[i + 1]
-                    if r_end - r_start > 1:
-                        gap_rows = range(r_start + 1, r_end)
+                    r_start_idx = rows_in_col[i]
+                    r_end_idx = rows_in_col[i + 1]
+                    if r_end_idx - r_start_idx > 1:
+                        gap_rows = range(r_start_idx + 1, r_end_idx)
                         all_gap_free = True
                         for gr in gap_rows:
                             target_cell = (gr, col)
@@ -531,7 +777,7 @@ def separar_ambiente_e_desenhar_divisorias(
     # 4. INSERÇÃO DA CATRACA (CT) ÚNICA
     corridor_cells = room_cells - target_bench_cells
     cell_ct_coord = None
-    if corridor_cells:
+    if corridor_cells and not reconstruir_sala:  # Se for sala fechada interna (reconstruir_sala=True), omite a catraca (CT)
         max_r = max(r for r, c in room_cells)
         bottom_corridors = [cell for cell in corridor_cells if cell[0] == max_r]
         if not bottom_corridors:
@@ -545,20 +791,23 @@ def separar_ambiente_e_desenhar_divisorias(
         else:
             bottom_corridors.sort(key=lambda x: x[1], reverse=True)
             
-        cell_ct_coord = bottom_corridors[0]
-        cell_ct = ws.cell(row=cell_ct_coord[0], column=cell_ct_coord[1])
-        
-        fill_ct = PatternFill(start_color="FF9900", end_color="FF9900", fill_type="solid")
-        font_ct = Font(color="FFFFFF", bold=True, size=8)
-        cell_ct.value = "CT"
-        cell_ct.fill = fill_ct
-        cell_ct.font = font_ct
+        # Ignora corredores em células mescladas ao escolher onde vai a catraca
+        bottom_corridors = [cell for cell in bottom_corridors if not _eh_celula_mesclada(ws, cell[0], cell[1])]
+        if bottom_corridors:
+            cell_ct_coord = bottom_corridors[0]
+            cell_ct = ws.cell(row=cell_ct_coord[0], column=cell_ct_coord[1])
 
-    # 4.5. Limpa os corredores internos da sala criada de forma isolada
+            fill_ct = PatternFill(start_color="FF9900", end_color="FF9900", fill_type="solid")
+            font_ct = Font(color="FFFFFF", bold=True, size=8)
+            cell_ct.value = "CT"
+            cell_ct.fill = fill_ct
+            cell_ct.font = font_ct
+
+    # 4.5. Limpa os corredores internos da sala criada
     if reconstruir_sala:
         for r, c in room_cells:
             if (r, c) not in target_bench_cells and (r, c) != cell_ct_coord:
-                if not _eh_pilar_ou_coluna(ws, r, c):
+                if not _eh_pilar_ou_coluna(ws, r, c) and not _eh_celula_mesclada(ws, r, c):
                     cell = ws.cell(row=r, column=c)
                     cell.value = ""
                     cell.fill = PatternFill(fill_type=None)
@@ -580,6 +829,8 @@ def _copiar_lado(side_obj):
     return Side(border_style=side_obj.style, color=side_obj.color)
 
 def _aplicar_borda_celula_unica(ws, r, c, side, side_style):
+    if _eh_celula_mesclada(ws, r, c):
+        return
     cell = ws.cell(row=r, column=c)
     b = cell.border
     top = _copiar_lado(b.top)
@@ -631,7 +882,6 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
     if n_benches == 0:
         return set()
         
-    # --- AGRUPAMENTO DAS BANCADAS EM MACRO-CLUSTERS ESPACIAIS (UNIÃO E BUSCA) ---
     parent = list(range(n_benches))
     
     def find(x):
@@ -663,7 +913,6 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
         
     clusters = list(clusters_map.values())
     
-    # --- INTELIGÊNCIA DE PARIDADE FACE-A-FACE ---
     adjusted_target_qty = target_qty
     possui_bancada_dupla = False
     for cl in clusters:
@@ -699,16 +948,12 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
         for cl, cap in clusters_with_cap:
             selected_benches.extend(cl)
             
-    # --- PREPARAÇÃO DE SESSÃO ORDENADA DE SELEÇÃO ---
     selected_set = set()
     selected_list = []
     
-    # Verificação se a meta exige mais mesas do que a maior bancada individual suporta.
     max_bench_cap = max(len(b) for b in selected_benches) if selected_benches else 0
     
     if adjusted_target_qty > max_bench_cap:
-        # PRIORIZAÇÃO DE PREENCHIMENTO COMPLETO DE CADA BLOCO/BANCADA
-        # Ordenamos espacialmente as bancadas para garantir preenchimento linear contínuo
         selected_benches_sorted = sorted(selected_benches, key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
         
         remaining_qty = adjusted_target_qty
@@ -731,7 +976,6 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
             remaining_qty -= take_qty
             
     else:
-        # SE A META COUBER INTEIRA EM UMA ÚNICA BANCADA, PRESERVA A BUSCA DE CORTE SIMÉTRICO OTIMAL
         vertical_benches = []
         horizontal_benches = []
         for b in selected_benches:
@@ -896,11 +1140,11 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                         
                     b_cols_sorted = sorted(list({c for r, c in b}))
                     allowed_cols = set(b_cols_sorted[:best_W])
-                    allowed_cells = [cell for cell in b if cell[1] in allowed_cols]
-                    allowed_cells.sort(key=lambda x: (x[1], x[0]))
+                    allocated_cells = [cell for cell in b if cell[1] in allowed_cols]
+                    allocated_cells.sort(key=lambda x: (x[1], x[0]))
                     
-                    take_qty = min(len(allowed_cells), remaining_qty)
-                    for cell in allowed_cells[:take_qty]:
+                    take_qty = min(len(allocated_cells), remaining_qty)
+                    for cell in allocated_cells[:take_qty]:
                         if cell not in selected_set:
                             selected_set.add(cell)
                             selected_list.append(cell)
@@ -908,7 +1152,6 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                     if remaining_qty <= 0:
                         break
 
-    # --- FALLBACK DE SEGURANÇA SE NADA FOR SELECIONADO ---
     if not selected_list:
         benches.sort(key=lambda b: min(b))
         remaining_qty = adjusted_target_qty
@@ -937,8 +1180,6 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                 remaining_qty = 0
                 break
 
-    # Truncamento cronológico cirúrgico usando estritamente a meta original (target_qty)
-    # Garante que o corte ocorra na ponta final da última bancada que estava sendo preenchida.
     if len(selected_list) > target_qty:
         selected_list = selected_list[:target_qty]
                 
@@ -956,8 +1197,8 @@ def testar_criacao_sala_manual(
     border_color: str = "FF9900"
 ):
     """
-    Carrega a planilha, seleciona a equipe principal e, caso solicitado, cria uma
-    sala fechada estruturada internamente com corredor de circulação próprio.
+    Carrega a planilha, seleciona a equipe principal de forma tradicional desenhando o
+    perímetro original do ambiente, e depois cria a sala interna dentro dele sem catraca.
     """
     print(f"\n[INICIANDO TESTE MANUAL] Bloco: {bloco_id} | Ambiente: {ambiente_letra} | PAs Solicitadas: {quantidade_mesas}")
     
@@ -975,30 +1216,36 @@ def testar_criacao_sala_manual(
         print(f"Erro: Não foi possível localizar células para o ambiente '{bloco_id}-{ambiente_letra}'.")
         return
 
-    # 1. Aloca e desenha as divisórias da equipe principal (120 mesas normais intactas)
-    allocated_ambiente = _selecionar_mesas_contiguas(env_cells, ws, quantidade_mesas)
+    allocated_sala = set()
+    room_cells_override = None
+    
+    # 1. Se solicitada a sala fechada, calcula sua área e células primeiro
+    if quantidade_mesas_sala is not None:
+        print(f"🛠️ Planejando Sala Fechada Estruturada de {quantidade_mesas_sala} mesas dentro do ambiente...")
+        allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(ws, env_cells, quantidade_mesas_sala)
+
+    # 2. Aloca a equipe principal estritamente no espaço restante (env_cells - room_cells_override)
+    # Isso implementa a compensação: se a sala consumiu mesas existentes, a equipe principal se expandirá no espaço livre remanescente.
+    available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
+    allocated_ambiente = _selecionar_mesas_contiguas(available_env_cells, ws, quantidade_mesas)
     
     if not allocated_ambiente:
-        print("Erro: Nenhuma mesa utilizável encontrada nesse ambiente.")
+        print("Erro: Nenhuma mesa utilizável encontrada nesse ambiente para a equipe principal.")
         return
 
+    # 3. Desenha as divisórias do contorno externo do Ambiente principal considerando a união de ambos (evita dentes na parede)
+    allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
     separar_ambiente_e_desenhar_divisorias(
         ws=ws, 
         env_cells=env_cells, 
-        allocated_cells=allocated_ambiente,
+        allocated_cells=allocated_total,
         border_style=border_style, 
         border_color=border_color,
         reconstruir_sala=False
     )
 
-    # 2. Se solicitada a sala, gera o layout estruturado interno e desenha no contorno correspondente
+    # 4. Desenha as divisórias internas da sala fechada e reconstrói as mesas e corredores apenas nessa área isolada
     if quantidade_mesas_sala is not None:
-        print(f"🛠️ Criando Sala Fechada Estruturada de {quantidade_mesas_sala} mesas dentro do ambiente...")
-        
-        # Gera o layout da sala estruturada (mesas e sua circulação interna dedicada)
-        allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(ws, env_cells, quantidade_mesas_sala)
-        
-        # Reconstrói as mesas e limpa corredores apenas no perímetro override da sala fechada
         separar_ambiente_e_desenhar_divisorias(
             ws=ws, 
             env_cells=env_cells, 
@@ -1016,7 +1263,7 @@ if __name__ == "__main__":
     testar_criacao_sala_manual(
         file_path="planta.xlsx",
         sheet_name="JPIII",
-        bloco_id="Bloco_2",          
+        bloco_id="Bloco_2",          # Note que o bloco_id no scan original de JPIII para a planta real é Bloco_2 (com o caractere underscore)
         ambiente_letra="A",         
         quantidade_mesas=120, 
         quantidade_mesas_sala=10,  # Exemplo de criação de sala dinâmica para 10 mesas com corredor
