@@ -166,6 +166,184 @@ def _celulas_contorno_do_ambiente(ws, env_cells: Set[Tuple[int, int]]) -> Set[Tu
                 
     return extra
 
+def _verificar_acessibilidade_mesas(
+    ws, 
+    env_cells: Set[Tuple[int, int]], 
+    room_cells: Set[Tuple[int, int]], 
+    desk_cells: Set[Tuple[int, int]]
+) -> Tuple[bool, Set[Tuple[int, int]]]:
+    """
+    Verifica se todas as mesas têm ao menos um caminho de corredor até a saída do ambiente.
+    A saída é definida como: célula de corredor adjacente a algo fora do room_cells 
+    (borda do ambiente, catraca, ou espaço externo).
+    
+    Retorna:
+        (acessivel, mesas_sem_saida) — True se todas têm saída, senão o conjunto das isoladas.
+    """
+    from collections import deque
+    
+    corridor_cells = room_cells - desk_cells
+    
+    # Identificar células de saída: corredores que fazem fronteira com algo fora do room_cells
+    # e que não têm parede laranja bloqueando essa transição
+    exit_cells: Set[Tuple[int, int]] = set()
+    for (r, c) in corridor_cells:
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) not in room_cells:
+                # Verifica se não há parede laranja bloqueando a passagem para fora
+                if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                    exit_cells.add((r, c))
+                    break
+    
+    if not exit_cells:
+        # Nenhuma saída encontrada — todas as mesas estão isoladas
+        return False, set(desk_cells)
+    
+    # BFS reverso: partindo das saídas, marca todos os corredores alcançáveis
+    alcancaveis: Set[Tuple[int, int]] = set()
+    fila = deque(exit_cells)
+    alcancaveis.update(exit_cells)
+    
+    while fila:
+        r, c = fila.popleft()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in alcancaveis:
+                continue
+            if (nr, nc) not in corridor_cells:
+                continue
+            if _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                continue
+            alcancaveis.add((nr, nc))
+            fila.append((nr, nc))
+    
+    # Verifica cada mesa: deve ter ao menos um corredor alcançável adjacente
+    mesas_sem_saida: Set[Tuple[int, int]] = set()
+    for (r, c) in desk_cells:
+        tem_acesso = False
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in alcancaveis and not _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                tem_acesso = True
+                break
+        if not tem_acesso:
+            mesas_sem_saida.add((r, c))
+    
+    return len(mesas_sem_saida) == 0, mesas_sem_saida
+
+
+def _expandir_corredor_para_acessibilidade(
+    ws,
+    env_cells: Set[Tuple[int, int]],
+    room_cells: Set[Tuple[int, int]],
+    desk_cells: Set[Tuple[int, int]],
+    mesas_sem_saida: Set[Tuple[int, int]]
+) -> Set[Tuple[int, int]]:
+    """
+    Tenta expandir o room_cells adicionando corredores para conectar mesas 
+    isoladas a uma saída. Faz BFS a partir de cada mesa sem saída até encontrar 
+    uma célula que já é alcançável ou uma borda do ambiente.
+    """
+    from collections import deque
+    
+    corridor_cells = room_cells - desk_cells
+    
+    # Identificar corredores já conectados à saída (mesmo lógica do verificador)
+    exit_cells: Set[Tuple[int, int]] = set()
+    for (r, c) in corridor_cells:
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) not in room_cells:
+                if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                    exit_cells.add((r, c))
+                    break
+    
+    alcancaveis: Set[Tuple[int, int]] = set()
+    fila = deque(exit_cells)
+    alcancaveis.update(exit_cells)
+    while fila:
+        r, c = fila.popleft()
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = r + dr, c + dc
+            if (nr, nc) in alcancaveis:
+                continue
+            if (nr, nc) not in corridor_cells:
+                continue
+            if _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                continue
+            alcancaveis.add((nr, nc))
+            fila.append((nr, nc))
+    
+    novos_corredores: Set[Tuple[int, int]] = set()
+    
+    for (mr, mc) in mesas_sem_saida:
+        # BFS a partir da mesa, expandindo por células livres do env_cells
+        visitado: Set[Tuple[int, int]] = set()
+        predecessores: dict = {}
+        fila_bfs = deque()
+        
+        # Inicia a partir dos vizinhos livres da mesa
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nr, nc = mr + dr, mc + dc
+            if (nr, nc) in desk_cells:
+                continue
+            if (nr, nc) not in env_cells:
+                continue
+            if _tem_parede_laranja_entre(ws, mr, mc, nr, nc):
+                continue
+            if _eh_pilar_ou_coluna(ws, nr, nc):
+                continue
+            fila_bfs.append((nr, nc))
+            visitado.add((nr, nc))
+            predecessores[(nr, nc)] = None
+        
+        destino = None
+        while fila_bfs and destino is None:
+            r, c = fila_bfs.popleft()
+            
+            # Verifica se chegamos a um corredor já alcançável ou à borda
+            if (r, c) in alcancaveis:
+                destino = (r, c)
+                break
+            
+            # Verifica se é borda do ambiente (adjacente a algo fora do room_cells sem parede)
+            for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr2, nc2 = r + dr2, c + dc2
+                if (nr2, nc2) not in room_cells and (nr2, nc2) not in env_cells:
+                    if not _tem_parede_laranja_entre(ws, r, c, nr2, nc2):
+                        destino = (r, c)
+                        break
+            if destino:
+                break
+            
+            # Expande vizinhos
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nr, nc = r + dr, c + dc
+                if (nr, nc) in visitado:
+                    continue
+                if (nr, nc) in desk_cells:
+                    continue
+                if (nr, nc) not in env_cells:
+                    continue
+                if _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                    continue
+                if _eh_pilar_ou_coluna(ws, nr, nc):
+                    continue
+                visitado.add((nr, nc))
+                predecessores[(nr, nc)] = (r, c)
+                fila_bfs.append((nr, nc))
+        
+        # Reconstrói o caminho e adiciona como corredor
+        if destino is not None:
+            atual = destino
+            while atual is not None:
+                novos_corredores.add(atual)
+                atual = predecessores.get(atual)
+    
+    return room_cells | novos_corredores
+
+
 def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
     """Absorve frestas de 1 a 2 células de largura contra as paredes para evitar novos contornos flutuantes."""
     room_cells = set(room_cells)
@@ -719,6 +897,13 @@ def separar_ambiente_e_desenhar_divisorias(
                                 room_cells.add((gr, col))
 
         room_cells = _absorver_gaps_estreitos(ws, env_cells, room_cells)
+
+        # Verificação de acessibilidade: todas as mesas devem ter caminho até a saída
+        acessivel, mesas_isoladas = _verificar_acessibilidade_mesas(ws, env_cells, room_cells, target_bench_cells)
+        if not acessivel and mesas_isoladas:
+            room_cells = _expandir_corredor_para_acessibilidade(
+                ws, env_cells, room_cells, target_bench_cells, mesas_isoladas
+            )
 
     corridor_cells = room_cells - target_bench_cells
     cell_ct_coord = None
