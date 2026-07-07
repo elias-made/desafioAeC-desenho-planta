@@ -15,14 +15,14 @@ class PosicionadorDeps:
     plant_info: str
     blocos_info: str
     premissas: str
-
+    
 @dataclass
 class OrganizadorDeps:
     plant_info: str
     blocos_info: str
     premissas: str
-    rascunho_layout: str
-    ambientes_criados: str  # Informações de salas físicas geradas pelo AmbienteBuilder
+    rascunho_layout: str     # Adicione esta linha
+    ambientes_criados: str   # Adicione esta linha
 
 # ══════════════════════════════════════════════════════════════════════════
 # Inicialização dos Agentes (Fluxo Unificado de 2 Etapas)
@@ -51,8 +51,8 @@ organizador = Agent(
 @organizador.system_prompt
 def organizador_prompt(ctx: RunContext[OrganizadorDeps]) -> str:
     return Prompts.ORGANIZADOR_TMPL.format(
-        rascunho_layout=ctx.deps.rascunho_layout,
         premissas=ctx.deps.premissas,
         blocos_info=ctx.deps.blocos_info,
-        ambientes_criados=ctx.deps.ambientes_criados
+        ambientes_criados=ctx.deps.ambientes_criados,
+        rascunho_layout=ctx.deps.rascunho_layout  # <--- ADICIONE ESTA LINHA
     )

@@ -1,11 +1,13 @@
 # ScannerPremissas.py
 
+import os
 import openpyxl
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Set
 
 # Variável global de cache para evitar múltiplas leituras físicas do Excel
-_orange_context_cache = None
+# Chaveado por file_path para suportar múltiplos arquivos (planta.xlsx vs proposta_final.xlsx)
+_orange_context_cache = {}  # Dict[str, List[Dict]]
 
 def manhattan_distance(c1: Tuple[int, int], c2: Tuple[int, int]) -> int:
     return abs(c1[0] - c2[0]) + abs(c1[1] - c2[1])
@@ -119,22 +121,35 @@ def cell_has_orange_border_or_fill(cell) -> bool:
     return cell_has_orange_fill(cell) or cell_has_orange_border(cell)
 
 def is_desk_cell(cell) -> bool:
-    """Verifica se a célula representa uma mesa de operador."""
+    """Verifica de forma dinâmica se a célula representa uma mesa de operador."""
     if cell is None or cell.value is None:
         return False
     val_str = str(cell.value).strip()
     val_upper = val_str.upper()
+    if not val_upper:
+        return False
+        
+    # Barreiras físicas conhecidas não são mesas
+    if val_upper in ('##', 'SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS'):
+        return False
+        
+    # Valores numéricos > 9 são anotações de capacidade, não assentos individuais
     try:
         val_num = float(val_upper)
-        # Se o valor numérico for maior que 9, trata-se de uma anotação de texto (ex: "124" ou "144"),
-        # e não de uma posição física de atendimento (PA).
         if val_num > 9:
             return False
         return True
     except ValueError:
         pass
-    if val_upper in ('VAZIO', 'T', "T'", 'ADM', 'I', 'Q'):
+        
+    # Novos clientes (ex: N_1, N_2) e marcas estáveis são considerados mesas
+    if val_upper.startswith("N_") or val_upper in ('VAZIO', 'T', "T'", 'ADM', 'I', 'Q'):
         return True
+        
+    # Identificadores alfanuméricos curtos adicionais
+    if len(val_upper) <= 15:
+        return True
+        
     return False
 
 def is_barrier_cell(cell) -> bool:
@@ -153,17 +168,40 @@ def is_barrier_cell(cell) -> bool:
             return True
     return False
 
-def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col: int) -> Set[Tuple[int, int]]:
+def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col: int, max_gap: int = 1) -> Set[Tuple[int, int]]:
+    """
+    Calcula quais células estão no interior do contorno laranja via BFS a partir das bordas
+    da planilha inteira, atravessando tudo que não seja parede.
+
+    Usa a mesma tolerância `max_gap` do agrupamento de macro-blocos (scan_orange_context) para
+    dilatar virtualmente a parede: qualquer célula a até `max_gap` de distância Manhattan de uma
+    célula de borda real é tratada como bloqueio durante a travessia externa. Isso evita que o
+    BFS "vaze" por pequenos buracos de 1 célula na parede física (comuns em plantas desenhadas
+    manualmente) e classifique erroneamente uma faixa interior como exterior.
+
+    Importante: a dilatação só afeta a travessia (blocking); o resultado final de `interior`
+    continua excluindo apenas as células de borda reais (border_cells), então as células do
+    "buraco" tratado como bloqueio acabam corretamente incluídas no interior (nunca alcançadas
+    pelo BFS externo, e não fazem parte da parede real).
+    """
+    blocking = set(border_cells)
+    if max_gap > 0:
+        for (r, c) in border_cells:
+            for dr in range(-max_gap, max_gap + 1):
+                for dc in range(-max_gap, max_gap + 1):
+                    if abs(dr) + abs(dc) <= max_gap:
+                        blocking.add((r + dr, c + dc))
+
     visited = set()
     queue = deque()
     for r in (1, max_row):
         for c in range(1, max_col + 1):
-            if (r, c) not in border_cells:
+            if (r, c) not in blocking:
                 queue.append((r, c))
                 visited.add((r, c))
     for c in (1, max_col):
         for r in range(1, max_row + 1):
-            if (r, c) not in border_cells and (r, c) not in visited:
+            if (r, c) not in blocking and (r, c) not in visited:
                 queue.append((r, c))
                 visited.add((r, c))
     while queue:
@@ -171,7 +209,7 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nr, nc = r + dr, c + dc
             if 1 <= nr <= max_row and 1 <= nc <= max_col:
-                if (nr, nc) not in border_cells and (nr, nc) not in visited:
+                if (nr, nc) not in blocking and (nr, nc) not in visited:
                     visited.add((nr, nc))
                     queue.append((nr, nc))
     interior = set()
@@ -184,8 +222,9 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
 
 def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
     global _orange_context_cache
-    if _orange_context_cache is not None:
-        return _orange_context_cache
+    cache_key = os.path.abspath(file_path)
+    if cache_key in _orange_context_cache:
+        return _orange_context_cache[cache_key]
 
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb[sheet_name]
@@ -272,7 +311,7 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
     idx_counter = 1
     for coords in valid_groups:
         coords_set = set(coords)
-        interior_raw = get_interior_cells(coords_set, ws.max_row, ws.max_column)
+        interior_raw = get_interior_cells(coords_set, ws.max_row, ws.max_column, max_gap=max_gap)
         
         boundary_seats = set()
         for r, c in coords_set:
@@ -421,8 +460,8 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         })
         idx_counter += 1
             
-    _orange_context_cache = macro_blocks
-    return _orange_context_cache
+    _orange_context_cache[cache_key] = macro_blocks
+    return _orange_context_cache[cache_key]
 
 def build_context_string_for_llm(macro_blocks: List[Dict]) -> str:
     if not macro_blocks:

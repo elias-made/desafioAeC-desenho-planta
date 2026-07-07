@@ -54,7 +54,7 @@ def _tem_parede_laranja_entre(ws, r1, c1, r2, c2) -> bool:
     
     from ScannerPremissas import is_color_orange_robust, cell_has_orange_fill
     
-    # CORREÇÃO 1: Células com preenchimento sólido de parede laranja funcionam como barreira sólida
+    # CORREÇÃO: Células com preenchimento sólido de parede laranja funcionam como barreira sólida
     if cell_has_orange_fill(cell1) or cell_has_orange_fill(cell2):
         return True
         
@@ -155,7 +155,6 @@ def _celulas_contorno_do_ambiente(ws, env_cells: Set[Tuple[int, int]]) -> Set[Tu
                 
             val = str(cell.value).strip().upper() if cell.value is not None else ""
             
-            # CORREÇÃO 2: Evita engolir mesas ou salas, mas preserva a anotação de "CATRACA" / "CT" da parede
             if _eh_celula_de_mesa_local(cell):
                 continue
             if val in ('SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'ESCANINHOS'):
@@ -172,35 +171,23 @@ def _verificar_acessibilidade_mesas(
     room_cells: Set[Tuple[int, int]], 
     desk_cells: Set[Tuple[int, int]]
 ) -> Tuple[bool, Set[Tuple[int, int]]]:
-    """
-    Verifica se todas as mesas têm ao menos um caminho de corredor até a saída do ambiente.
-    A saída é definida como: célula de corredor adjacente a algo fora do room_cells 
-    (borda do ambiente, catraca, ou espaço externo).
-    
-    Retorna:
-        (acessivel, mesas_sem_saida) — True se todas têm saída, senão o conjunto das isoladas.
-    """
+    """Verifica se todas as mesas têm ao menos um caminho de corredor até a saída do ambiente."""
     from collections import deque
     
     corridor_cells = room_cells - desk_cells
     
-    # Identificar células de saída: corredores que fazem fronteira com algo fora do room_cells
-    # e que não têm parede laranja bloqueando essa transição
     exit_cells: Set[Tuple[int, int]] = set()
     for (r, c) in corridor_cells:
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nr, nc = r + dr, c + dc
             if (nr, nc) not in room_cells:
-                # Verifica se não há parede laranja bloqueando a passagem para fora
                 if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
                     exit_cells.add((r, c))
                     break
     
     if not exit_cells:
-        # Nenhuma saída encontrada — todas as mesas estão isoladas
         return False, set(desk_cells)
     
-    # BFS reverso: partindo das saídas, marca todos os corredores alcançáveis
     alcancaveis: Set[Tuple[int, int]] = set()
     fila = deque(exit_cells)
     alcancaveis.update(exit_cells)
@@ -218,7 +205,6 @@ def _verificar_acessibilidade_mesas(
             alcancaveis.add((nr, nc))
             fila.append((nr, nc))
     
-    # Verifica cada mesa: deve ter ao menos um corredor alcançável adjacente
     mesas_sem_saida: Set[Tuple[int, int]] = set()
     for (r, c) in desk_cells:
         tem_acesso = False
@@ -240,16 +226,11 @@ def _expandir_corredor_para_acessibilidade(
     desk_cells: Set[Tuple[int, int]],
     mesas_sem_saida: Set[Tuple[int, int]]
 ) -> Set[Tuple[int, int]]:
-    """
-    Tenta expandir o room_cells adicionando corredores para conectar mesas 
-    isoladas a uma saída. Faz BFS a partir de cada mesa sem saída até encontrar 
-    uma célula que já é alcançável ou uma borda do ambiente.
-    """
+    """Tenta expandir o room_cells adicionando corredores para conectar mesas isoladas."""
     from collections import deque
     
     corridor_cells = room_cells - desk_cells
     
-    # Identificar corredores já conectados à saída (mesmo lógica do verificador)
     exit_cells: Set[Tuple[int, int]] = set()
     for (r, c) in corridor_cells:
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
@@ -278,12 +259,10 @@ def _expandir_corredor_para_acessibilidade(
     novos_corredores: Set[Tuple[int, int]] = set()
     
     for (mr, mc) in mesas_sem_saida:
-        # BFS a partir da mesa, expandindo por células livres do env_cells
         visitado: Set[Tuple[int, int]] = set()
         predecessores: dict = {}
         fila_bfs = deque()
         
-        # Inicia a partir dos vizinhos livres da mesa
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nr, nc = mr + dr, mc + dc
             if (nr, nc) in desk_cells:
@@ -302,12 +281,10 @@ def _expandir_corredor_para_acessibilidade(
         while fila_bfs and destino is None:
             r, c = fila_bfs.popleft()
             
-            # Verifica se chegamos a um corredor já alcançável ou à borda
             if (r, c) in alcancaveis:
                 destino = (r, c)
                 break
             
-            # Verifica se é borda do ambiente (adjacente a algo fora do room_cells sem parede)
             for dr2, dc2 in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 nr2, nc2 = r + dr2, c + dc2
                 if (nr2, nc2) not in room_cells and (nr2, nc2) not in env_cells:
@@ -317,7 +294,6 @@ def _expandir_corredor_para_acessibilidade(
             if destino:
                 break
             
-            # Expande vizinhos
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 nr, nc = r + dr, c + dc
                 if (nr, nc) in visitado:
@@ -334,7 +310,6 @@ def _expandir_corredor_para_acessibilidade(
                 predecessores[(nr, nc)] = (r, c)
                 fila_bfs.append((nr, nc))
         
-        # Reconstrói o caminho e adiciona como corredor
         if destino is not None:
             atual = destino
             while atual is not None:
@@ -387,7 +362,6 @@ def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Se
     return room_cells
 
 def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
-    """Identifica as coordenadas de células de forma tolerante a alucinações de letras."""
     if not block_id_str or not env_letter:
         return []
     block_match = re.search(r'\d+', str(block_id_str))
@@ -399,8 +373,13 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
         block_envs = {e['id'].upper(): e for e in block.get('ambientes', [])}
         
         target_env = env_letter.upper()
-        if target_env not in block_envs and len(block_envs) == 1:
-            target_env = list(block_envs.keys())[0]
+        if target_env not in block_envs:
+            # Se não encontrar o ambiente específico (pois é novo), pega o de maior capacidade do bloco (área aberta principal)
+            if block_envs:
+                sorted_envs = sorted(block_envs.values(), key=lambda e: len(e['cells']), reverse=True)
+                target_env = sorted_envs[0]['id'].upper()
+            else:
+                return []
             
         parts = re.split(r'[-_\s+&,|/]+', target_env)
         matched_envs = []
@@ -637,6 +616,14 @@ def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Se
         sorted_usable = sorted(list(usable), key=lambda x: (x[1], x[0]))
         desks = set(sorted_usable[:N])
         
+    # REGRA DE PREENCHIMENTO RESIDUAL
+    if len(desks) < N:
+        remaining_usable = sorted(list(usable - desks), key=lambda x: (x[1], x[0]))
+        for cell in remaining_usable:
+            if len(desks) >= N:
+                break
+            desks.add(cell)
+        
     return desks
 
 def _gerar_layout_sala_estruturado(ws, env_cells: Set[Tuple[int, int]], N: int) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
@@ -722,29 +709,45 @@ def separar_ambiente_e_desenhar_divisorias(
     env_cells = set(env_cells) | _celulas_contorno_do_ambiente(ws, env_cells)
     
     side_style = Side(border_style=border_style, color=border_color)
-    allocated = set(allocated_cells) & env_cells
-    if not allocated:
-        allocated = set(allocated_cells)
-
+    
+    # CORREÇÃO 1: Isola as mesas reais do ambiente principal das células da sala estruturada
     if room_cells_override is not None:
+        mesas_reais = set(allocated_cells) - set(room_cells_override)
+        if not mesas_reais:
+            mesas_reais = set(allocated_cells)
+        allocated = mesas_reais & env_cells
+    else:
+        allocated = set(allocated_cells) & env_cells
+        if not allocated:
+            allocated = set(allocated_cells)
+
+    if room_cells_override is not None and reconstruir_sala:
         room_cells = set(room_cells_override)
         target_bench_cells = set(allocated_cells) & room_cells
         if not target_bench_cells:
             target_bench_cells = set(allocated_cells)
         
-        if reconstruir_sala:
-            fill_desk = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
-            font_desk = Font(name="Calibri", size=9)
-            for r, c in target_bench_cells:
-                if _eh_celula_mesclada(ws, r, c):
-                    continue
+        # LIMPEZA CRÍTICA: Apaga todas as bordas internas antigas de todas as células da nova sala
+        for r, c in room_cells:
+            if not _eh_celula_mesclada(ws, r, c):
                 cell = ws.cell(row=r, column=c)
-                cell.value = "vazio"
-                cell.fill = fill_desk
-                cell.font = font_desk
+                cell.border = Border()  # Reseta qualquer borda preexistente interna
+
+        fill_desk = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
+        font_desk = Font(name="Calibri", size=9)
+        for r, c in target_bench_cells:
+            if _eh_celula_mesclada(ws, r, c):
+                continue
+            cell = ws.cell(row=r, column=c)
+            cell.value = "vazio"
+            cell.fill = fill_desk
+            cell.font = font_desk
     else:
         all_desks_in_env = set()
         for r, c in env_cells:
+            # CORREÇÃO 2: Não misturar o espaço da sala estruturada com a varredura de mesas comuns
+            if room_cells_override is not None and (r, c) in room_cells_override:
+                continue
             cell = ws.cell(row=r, column=c)
             val_str = str(cell.value).strip().upper() if cell.value is not None else ""
             if _eh_celula_de_mesa_local(cell) or (r, c) in allocated or val_str.startswith("N_"):
@@ -905,6 +908,10 @@ def separar_ambiente_e_desenhar_divisorias(
                 ws, env_cells, room_cells, target_bench_cells, mesas_isoladas
             )
 
+        # CORREÇÃO 3: Unifica o contorno geométrico das salas apenas no final para evitar 'dentes na parede'
+        if room_cells_override is not None:
+            room_cells = room_cells | room_cells_override
+
     corridor_cells = room_cells - target_bench_cells
     cell_ct_coord = None
     if corridor_cells and not reconstruir_sala:
@@ -938,6 +945,8 @@ def separar_ambiente_e_desenhar_divisorias(
                     cell = ws.cell(row=r, column=c)
                     cell.value = ""
                     cell.fill = PatternFill(fill_type=None)
+                    # Reseta as bordas internas de corredores para não herdar vestígios
+                    cell.border = Border()
 
     for r, c in room_cells:
         if (r - 1, c) not in room_cells:
@@ -955,6 +964,8 @@ def _copiar_lado(side_obj):
     return Side(border_style=side_obj.style, color=side_obj.color)
 
 def _aplicar_borda_celula_unica(ws, r, c, side, side_style):
+    if _eh_celula_mesclada(ws, r, c):
+        return
     cell = ws.cell(row=r, column=c)
     b = cell.border
     top = _copiar_lado(b.top)
@@ -1273,8 +1284,8 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
                     allowed_cells = [cell for cell in b if cell[1] in allowed_cols]
                     allowed_cells.sort(key=lambda x: (x[1], x[0]))
                     
-                    take_qty = min(len(allocated_cells), remaining_qty)
-                    for cell in allocated_cells[:take_qty]:
+                    take_qty = min(len(allowed_cells), remaining_qty)
+                    for cell in allowed_cells[:take_qty]:
                         if cell not in selected_set:
                             selected_set.add(cell)
                             selected_list.append(cell)
@@ -1365,7 +1376,8 @@ def testar_criacao_sala_manual(
         allocated_cells=allocated_total,
         border_style=border_style, 
         border_color=border_color,
-        reconstruir_sala=False
+        reconstruir_sala=False,
+        room_cells_override=room_cells_override
     )
 
     if quantidade_mesas_sala is not None:
@@ -1388,7 +1400,7 @@ if __name__ == "__main__":
         sheet_name="JPIII",
         bloco_id="Bloco_7",
         ambiente_letra="A",         
-        quantidade_mesas=165, 
+        quantidade_mesas=124, 
         quantidade_mesas_sala=4,
         output_path="planta_teste_sala.xlsx"
     )
