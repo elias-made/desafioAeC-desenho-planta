@@ -22,7 +22,7 @@ from LayoutEngine import (
 )
 
 # Importando dependências do AmbienteBuilder
-from AmbienteBuilder import separar_ambiente_e_desenhar_divisorias, _selecionar_mesas_contiguas, _gerar_layout_sala_estruturado
+from AmbienteBuilder import separar_ambiente_e_desenhar_divisorias, _selecionar_mesas_contiguas, _gerar_layout_sala_estruturado, gerar_alternativas_mesas
 
 # Importando dependências e agentes do Agents.py (Fluxo de 2 Agentes)
 from Agents import PosicionadorDeps, OrganizadorDeps, posicionador, organizador
@@ -36,7 +36,12 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════
 
 def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
-    """Identifica as coordenadas das células sempre priorizando a maior área aberta restante do bloco."""
+    """Identifica as coordenadas das células de TODOS os ambientes do bloco.
+    
+    Para criação consecutiva de novos ambientes no mesmo bloco, precisamos do espaço
+    total disponível — não apenas o maior fragmento. A subtração das células já consumidas
+    (feita pelo acumulador no loop principal) garante que não haja sobreposição.
+    """
     if not block_id_str or not env_letter:
         return []
     block_match = re.search(r'\d+', str(block_id_str))
@@ -50,21 +55,12 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
         if not block_envs:
             return []
             
-        # Para criação de novos ambientes (criar_ambientes), sempre extraímos da maior área aberta restante do bloco
-        # Isso evita colisões causadas por reordenações dinâmicas de letras das salas
-        sorted_envs = sorted(block_envs.values(), key=lambda e: len(e['cells']), reverse=True)
-        target_env = sorted_envs[0]['id'].upper()
-            
-        parts = re.split(r'[-_\s+&,|/]+', target_env)
-        matched_envs = []
-        for p in parts:
-            if p in block_envs:
-                matched_envs.append(block_envs[p])
-        if matched_envs:
-            cells = []
-            for env in matched_envs:
-                cells.extend(env['cells'])
-            return cells
+        # Retorna TODAS as células de todos os ambientes do bloco
+        # O acumulador de consumidas no loop principal garante a não-sobreposição
+        cells = []
+        for env in block_envs.values():
+            cells.extend(env['cells'])
+        return cells
     return []
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -219,6 +215,12 @@ async def main():
     if criar_ambientes_solicitados:
         print("🛠️ Iniciando AmbienteBuilder para desenhar divisórias físicas...")
         
+        # CORREÇÃO: Acumulador de células já consumidas por ambientes anteriores no mesmo bloco
+        # Evita sobreposição e restauração destrutiva entre iterações consecutivas
+        celulas_ja_consumidas: set = set()
+        # Mapeia bloco -> conjunto de células já alocadas (para exclusão precisa por bloco)
+        celulas_consumidas_por_bloco: dict = {}
+        
         for amb in criar_ambientes_solicitados:
             # Limpa o cache e força o re-scan físico a cada nova sala criada
             import ScannerPremissas
@@ -231,7 +233,13 @@ async def main():
             cliente_dest = amb.get("cliente_destinado")
             sala_lugares = amb.get("sala_lugares", 0)
             
-            env_cells = set(get_env_cells(bloco_id, ambiente_letra, macro_blocks_atual))
+            env_cells_raw = set(get_env_cells(bloco_id, ambiente_letra, macro_blocks_atual))
+            
+            # CORREÇÃO: Remove as células já consumidas por ambientes anteriores no mesmo bloco
+            # para garantir que não haja sobreposição de seleção de mesas
+            consumidas_neste_bloco = celulas_consumidas_por_bloco.get(bloco_id, set())
+            env_cells = env_cells_raw - consumidas_neste_bloco
+            
             if env_cells:
                 allocated_sala = set()
                 room_cells_override = None
@@ -243,19 +251,37 @@ async def main():
                 
                 # Seleciona as mesas do salão aberto com base no restante das células livres do bloco
                 available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
-                allocated_ambiente = _selecionar_mesas_contiguas(available_env_cells, new_ws, qtd_mesas)
+                alternativas = gerar_alternativas_mesas(
+                    available_env_cells, new_ws, qtd_mesas
+                )
+                allocated_ambiente = alternativas[0] if alternativas else set()
                 
                 if allocated_ambiente:
                     allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
                     
                     # 1. Desenha o contorno das divisórias do salão aberto
-                    separar_ambiente_e_desenhar_divisorias(
-                        ws=new_ws, 
-                        env_cells=env_cells, 
-                        allocated_cells=allocated_total,
-                        reconstruir_sala=False,
-                        room_cells_override=room_cells_override
-                    )
+                    # A nova lógica BFS do builder para automaticamente ao encontrar mesas de outros clientes
+                    ambiente_fisico = {"valido": False, "motivo": "sem alternativa válida"}
+                    for alternativa in alternativas:
+                        candidato_total = alternativa | (
+                            room_cells_override if room_cells_override else set()
+                        )
+                        tentativa = separar_ambiente_e_desenhar_divisorias(
+                            ws=new_ws,
+                            env_cells=env_cells,
+                            allocated_cells=candidato_total,
+                            reconstruir_sala=False,
+                            room_cells_override=room_cells_override,
+                        )
+                        if tentativa.get("valido"):
+                            allocated_ambiente = alternativa
+                            allocated_total = candidato_total
+                            ambiente_fisico = tentativa
+                            break
+                        ambiente_fisico = tentativa
+                    if not ambiente_fisico.get("valido"):
+                        print(f"   Ambiente físico inválido: {ambiente_fisico.get('motivo')}")
+                        continue
                     
                     # 2. Desenha o contorno interno e as mesas da sala fechada estruturada
                     if room_cells_override:
@@ -301,20 +327,35 @@ async def main():
                             cell.value = cliente_dest
                             cell.fill = fill_to_apply
                             cell.font = font_to_apply
-                            
-                    # MODIFICAÇÃO: Mantém as mesas internas da sala de reunião completamente apagadas/limpas
+                    
+                    # Preenche mesas da sala de reunião com estilo visual "vazio" cinza (indicando assentos de reunião)
                     if room_cells_override:
+                        fill_sala = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
+                        font_sala = Font(name="Calibri", size=9)
                         for r, c in allocated_sala:
                             cell = new_ws.cell(row=r, column=c)
                             if cell.value != "CT":
-                                cell.value = ""  # Sem escrita
-                                cell.fill = PatternFill(fill_type=None)  # Sem preenchimento
-                                cell.font = Font(name="Calibri", size=9)
+                                cell.value = "vazio"
+                                cell.fill = fill_sala
+                                cell.font = font_sala
 
+                    # CORREÇÃO: Registra TODAS as células consumidas nesta iteração no acumulador
+                    # Registra apenas as mesas alocadas efetivamente — não o envelope inteiro
+                    all_allocated_cells = (
+                        allocated_ambiente
+                        | (allocated_sala if allocated_sala else set())
+                        | ambiente_fisico.get("relocated_cells", set())
+                    )
+                    celulas_ja_consumidas.update(all_allocated_cells)
+                    celulas_consumidas_por_bloco.setdefault(bloco_id, set()).update(
+                        ambiente_fisico["room_cells"]
+                        | ambiente_fisico.get("relocated_cells", set())
+                    )
+                    
                     # Restaura as demais células do bloco que não foram consumidas para o snapshot original
-                    all_allocated_cells = allocated_ambiente | (allocated_sala if allocated_sala else set())
+                    # CORREÇÃO: Protege células de ambientes criados em iterações ANTERIORES contra restauração
                     for r, c in env_cells:
-                        if (r, c) not in all_allocated_cells:
+                        if (r, c) not in all_allocated_cells and (r, c) not in celulas_ja_consumidas:
                             cell = new_ws.cell(row=r, column=c)
                             if cell.value != "CT":
                                 snap = original_snapshot.get((r, c))

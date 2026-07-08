@@ -361,6 +361,123 @@ def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Se
             
     return room_cells
 
+
+def _realocar_mesas_bloqueadas(ws, env_cells, room_cells, novas_mesas):
+    """Realoca mesas remanescentes que perderam acesso após o novo fechamento."""
+    from collections import deque
+    from copy import copy
+    from ScannerPremissas import cell_has_orange_fill, is_barrier_cell
+
+    env_cells = set(env_cells)
+    room_cells = set(room_cells)
+    novas_mesas = set(novas_mesas)
+    mesas = {
+        coord for coord in env_cells - room_cells
+        if _eh_celula_de_mesa_local(ws.cell(row=coord[0], column=coord[1]))
+        and coord not in novas_mesas
+    }
+
+    piso = set()
+    for r, c in env_cells - room_cells - mesas:
+        cell = ws.cell(row=r, column=c)
+        valor = str(cell.value or "").strip().upper()
+        if _eh_celula_mesclada(ws, r, c) or _eh_pilar_ou_coluna(ws, r, c):
+            continue
+        if cell_has_orange_fill(cell) or is_barrier_cell(cell):
+            continue
+        if valor in ("CT", "CATRACA"):
+            continue
+        piso.add((r, c))
+
+    def saidas(piso_atual):
+        resultado = set()
+        for r, c in env_cells:
+            valor = str(ws.cell(row=r, column=c).value or "").strip().upper()
+            if valor not in ("CT", "CATRACA"):
+                continue
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                vizinha = (r + dr, c + dc)
+                if vizinha in piso_atual:
+                    resultado.add(vizinha)
+        for r, c in piso_atual:
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                vizinha = (r + dr, c + dc)
+                if vizinha not in env_cells and not _tem_parede_laranja_entre(
+                    ws, r, c, vizinha[0], vizinha[1]
+                ):
+                    resultado.add((r, c))
+                    break
+        return resultado
+
+    def avaliar(mesas_atuais, piso_atual):
+        alcancaveis = set(saidas(piso_atual))
+        fila = deque(alcancaveis)
+        while fila:
+            r, c = fila.popleft()
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                vizinha = (r + dr, c + dc)
+                if vizinha in alcancaveis or vizinha not in piso_atual:
+                    continue
+                if _tem_parede_laranja_entre(ws, r, c, vizinha[0], vizinha[1]):
+                    continue
+                alcancaveis.add(vizinha)
+                fila.append(vizinha)
+        bloqueadas = set()
+        for r, c in mesas_atuais:
+            if not any(
+                (r + dr, c + dc) in alcancaveis
+                and not _tem_parede_laranja_entre(ws, r, c, r + dr, c + dc)
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
+            ):
+                bloqueadas.add((r, c))
+        return bloqueadas, alcancaveis
+
+    movimentos = []
+    bloqueadas, alcancaveis = avaliar(mesas, piso)
+    while bloqueadas:
+        origem = min(bloqueadas)
+        mesas_sem_origem = mesas - {origem}
+        piso_com_origem = piso | {origem}
+        _, alcancaveis_base = avaliar(mesas_sem_origem, piso_com_origem)
+        candidatos = [
+            coord for coord in alcancaveis_base
+            if coord != origem
+            and any(
+                (coord[0] + dr, coord[1] + dc) in alcancaveis_base - {coord}
+                for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
+            )
+        ]
+        candidatos.sort(key=lambda p: (abs(p[0] - origem[0]) + abs(p[1] - origem[1]), p))
+
+        melhor = None
+        for destino in candidatos:
+            mesas_teste = mesas_sem_origem | {destino}
+            piso_teste = piso_com_origem - {destino}
+            novas_bloqueadas, _ = avaliar(mesas_teste, piso_teste)
+            if len(novas_bloqueadas) < len(bloqueadas):
+                melhor = (destino, mesas_teste, piso_teste, novas_bloqueadas)
+                break
+        if melhor is None:
+            break
+        destino, mesas, piso, bloqueadas = melhor
+        movimentos.append((origem, destino))
+
+    if bloqueadas:
+        return False, [], bloqueadas
+
+    for origem, destino in movimentos:
+        source = ws.cell(row=origem[0], column=origem[1])
+        target = ws.cell(row=destino[0], column=destino[1])
+        target.value = source.value
+        target.fill = copy(source.fill)
+        target.font = copy(source.font)
+        target.alignment = copy(source.alignment)
+        source.value = ""
+        source.fill = PatternFill(fill_type=None)
+        source.font = Font(name="Calibri", size=9)
+
+    return True, movimentos, set()
+
 def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
     if not block_id_str or not env_letter:
         return []
@@ -699,10 +816,10 @@ def separar_ambiente_e_desenhar_divisorias(
     border_color: str = "FF9900",
     reconstruir_sala: bool = False,
     room_cells_override: Set[Tuple[int, int]] = None
-):
+) -> dict:
     """Desenha as divisórias ao redor das bancadas e suporta a criação de salas estruturadas."""
     if not allocated_cells or not env_cells:
-        return
+        return {"valido": False, "motivo": "Área ou alocação vazia.", "room_cells": set()}
 
     from BlockMapper import flood_fill
 
@@ -912,6 +1029,23 @@ def separar_ambiente_e_desenhar_divisorias(
         if room_cells_override is not None:
             room_cells = room_cells | room_cells_override
 
+        realocacao_ok, mesas_realocadas, bloqueadas_origem = _realocar_mesas_bloqueadas(
+            ws, env_cells, room_cells, target_bench_cells
+        )
+        if not realocacao_ok:
+            return {
+                "valido": False,
+                "motivo": f"{len(bloqueadas_origem)} mesa(s) do ambiente original sem destino válido.",
+                "room_cells": set(room_cells),
+                "corridor_cells": set(room_cells) - set(target_bench_cells),
+                "desk_cells": set(target_bench_cells),
+                "ct_cell": None,
+                "mesas_sem_saida": set(bloqueadas_origem),
+                "relocated_cells": set(),
+            }
+    if reconstruir_sala:
+        mesas_realocadas = []
+
     corridor_cells = room_cells - target_bench_cells
     cell_ct_coord = None
     if corridor_cells and not reconstruir_sala:
@@ -957,6 +1091,18 @@ def separar_ambiente_e_desenhar_divisorias(
             _aplicar_borda_espelhada(ws, r, c, 'left', side_style)
         if (r, c + 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'right', side_style)
+
+    return {
+        "valido": True,
+        "motivo": "",
+        "room_cells": set(room_cells),
+        "corridor_cells": set(room_cells) - set(target_bench_cells),
+        "desk_cells": set(target_bench_cells),
+        "ct_cell": cell_ct_coord,
+        "mesas_sem_saida": set(),
+        "relocated_cells": {coord for movimento in mesas_realocadas for coord in movimento},
+        "relocations": list(mesas_realocadas),
+    }
 
 def _copiar_lado(side_obj):
     if not side_obj or not side_obj.style or side_obj.style == 'none':
@@ -1325,6 +1471,27 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
         selected_list = selected_list[:target_qty]
                 
     return set(selected_list)
+
+def gerar_alternativas_mesas(env_cells, ws, target_qty):
+    """Compatibilidade: seleção antiga primeiro e cortes espaciais como fallback."""
+    mesas = {(r, c) for r, c in env_cells
+             if _eh_celula_de_mesa_local(ws.cell(row=r, column=c))}
+    if len(mesas) < target_qty:
+        return []
+    alternativas, vistas = [], set()
+    def adicionar(candidato):
+        candidato = frozenset(candidato)
+        if len(candidato) == target_qty and candidato not in vistas:
+            vistas.add(candidato)
+            alternativas.append(set(candidato))
+    adicionar(_selecionar_mesas_contiguas(env_cells, ws, target_qty))
+    for chave in (
+        lambda p: (p[0], p[1]), lambda p: (-p[0], p[1]),
+        lambda p: (p[1], p[0]), lambda p: (-p[1], p[0]),
+    ):
+        adicionar(sorted(mesas, key=chave)[:target_qty])
+    return alternativas
+
 
 def testar_criacao_sala_manual(
     file_path: str,
