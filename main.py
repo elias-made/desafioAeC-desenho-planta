@@ -4,16 +4,25 @@ import asyncio
 import os
 import shutil
 import openpyxl
+import traceback
+import re
+from copy import copy
+from typing import List, Tuple
 from dotenv import load_dotenv
+from openpyxl.styles import PatternFill, Font
 
-# Importando dependências do LayoutEngine modularizado
+# Importando dependências do LayoutEngine
 from LayoutEngine import (
     SHEET_NAME, FORBIDDEN_PATTERNS,
     Acao, PropostaMock, clean_json_string, extrair_e_carregar_json,
     load_plant, clone_ws, build_plant_info, build_blocos_info,
     execute_alocacao, write_report, salvar_auditoria,
-    normalizar_acoes, validar_inventario
+    normalizar_acoes, validar_inventario, FILL_LIBERADO, FONT_SMALL,
+    FILL_NEW_CLIENT, FONT_WHITE
 )
+
+# Importando dependências do AmbienteBuilder
+from AmbienteBuilder import separar_ambiente_e_desenhar_divisorias, _selecionar_mesas_contiguas, _gerar_layout_sala_estruturado, gerar_alternativas_mesas
 
 # Importando dependências e agentes do Agents.py (Fluxo de 2 Agentes)
 from Agents import PosicionadorDeps, OrganizadorDeps, posicionador, organizador
@@ -21,6 +30,38 @@ from ScannerPremissas import scan_orange_context, normalize_val
 from BlockMapper import scan_plant
 
 load_dotenv()
+
+# ══════════════════════════════════════════════════════════════════════════
+# Sobrescrita Local de get_env_cells para Criação de Salas Consecutivas
+# ══════════════════════════════════════════════════════════════════════════
+
+def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
+    """Identifica as coordenadas das células de TODOS os ambientes do bloco.
+    
+    Para criação consecutiva de novos ambientes no mesmo bloco, precisamos do espaço
+    total disponível — não apenas o maior fragmento. A subtração das células já consumidas
+    (feita pelo acumulador no loop principal) garante que não haja sobreposição.
+    """
+    if not block_id_str or not env_letter:
+        return []
+    block_match = re.search(r'\d+', str(block_id_str))
+    if not block_match:
+        return []
+    block_idx = int(block_match.group())
+    if block_idx <= len(macro_blocks):
+        block = macro_blocks[block_idx - 1]
+        block_envs = {e['id'].upper(): e for e in block.get('ambientes', [])}
+        
+        if not block_envs:
+            return []
+            
+        # Retorna TODAS as células de todos os ambientes do bloco
+        # O acumulador de consumidas no loop principal garante a não-sobreposição
+        cells = []
+        for env in block_envs.values():
+            cells.extend(env['cells'])
+        return cells
+    return []
 
 # ══════════════════════════════════════════════════════════════════════════
 # Fluxo de Execução Principal (Unificado de 2 Etapas com Auto-Correção)
@@ -35,24 +76,35 @@ async def main():
     regras_nomes_sistema = (
         "\n=== DIRETRIZES DE NOMENCLATURA SISTÊMICA (OBRIGATÓRIO) ===\n"
         "Ao criar novas operações sugeridas nas premissas, você DEVE nomeá-las de forma sequencial:\n"
-        "  - A primeira operação criada deve ser nomeada rigorosamente como: 'NOVO_A'\n"
-        "  - A segunda operação criada deve ser nomeada rigorosamente como: 'NOVO_B'\n"
-        "  - A terceira operação criada deve ser nomeada rigorosamente como: 'NOVO_C'\n"
-        "E assim por diante. Use sempre letras maiúsculas e mantenha a consistência nominal.\n"
+        "  - A primeira operação criada deve ser nomeada rigorosamente como: 'N_1'\n"
+        "  - A segunda operação criada deve ser nomeada rigorosamente como: 'N_2'\n"
+        "  - A terceira operação criada deve ser nomeada rigorosamente como: 'N_3'\n"
+        "E assim por diante. Use sempre este padrão e mantenha a consistência nominal.\n"
     )
 
     # Extrai o contexto visual das bordas laranjas (necessário para o mapeamento de células permitidas)
     dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME)
     
-    # Consolida as diretrizes do sistema com o texto de entrada (agora as anotações visuais vão direto no bloco!)
+    # Consolida as diretrizes do sistema com o texto de entrada (as anotações visuais vão direto no bloco)
     premissas_completas = f"{premissas_txt}\n{regras_nomes_sistema}"
 
     # Carrega a planta original e escaneia os dados iniciais
     wb, ws = load_plant()
-    plant_data = scan_plant(ws, FORBIDDEN_PATTERNS)
     
+    # --- SNAPSHOT DA PLANILHA ORIGINAL (Restauração Perfeita de Inventário) ---
+    original_snapshot = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=c)
+            original_snapshot[(r, c)] = {
+                'value': cell.value,
+                'fill': copy(cell.fill) if cell.has_style else None,
+                'font': copy(cell.font) if cell.has_style else None
+            }
+
+    plant_data = scan_plant(ws, FORBIDDEN_PATTERNS)
     plant_info_str = build_plant_info(plant_data)
-    blocos_info_str = build_blocos_info(plant_data, ws.max_row, ws.max_column, ws)
+    blocos_info_str = build_blocos_info(plant_data, ws.max_row, ws.max_column, ws, file_path='planta.xlsx')
     
     # ── PROTEÇÃO CONTRA USO DE CORREDORES ──
     allowed_cells = set()
@@ -75,7 +127,7 @@ async def main():
     # ─────────────────────────────────────────────────────────────────────────────
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ETAPA 1: Execução do Posicionador com Loop de Auto-Correção Interno
+    # ETAPA 1: Execução Direta do Posicionador (Sem Loops Desnecessários)
     # ══════════════════════════════════════════════════════════════════════════
     print("1. Posicionador gerando ações primárias (alocação bruta)...")
     
@@ -86,146 +138,480 @@ async def main():
     new_wb = openpyxl.load_workbook(dest_file)
     new_ws = new_wb[SHEET_NAME]
 
-    erros_validacao = []
-    rascunho_layout_json = ""
-    pos_data = {}
+    pos_deps = PosicionadorDeps(
+        plant_info=plant_info_str,
+        blocos_info=blocos_info_str,
+        premissas=premissas_completas
+    )
+    
+    # Execução única e direta do Posicionador para gerar o rascunho inicial
+    res_posicionador = await posicionador.run(
+        "Gere a proposta de alocação inicial baseada nas premissas de negócio.", 
+        deps=pos_deps
+    )
+    rascunho_layout_json = clean_json_string(res_posicionador.output)
+    pos_data = extrair_e_carregar_json(rascunho_layout_json)
+    
+    # Executa a alocação bruta na planilha master
     acoes_totais = []
-    log_acumulado = {}
-    proposta_inicial = None
-    parametros_premissas = {"reducoes": {}, "novos_clientes": []}
-
-    for pos_iter in range(1, 4):
-        print(f"   -> Tentativa do Posicionador {pos_iter}/3...")
-        pos_deps = PosicionadorDeps(
-            plant_info=plant_info_str,
-            blocos_info=blocos_info_str,
-            premissas=premissas_completas
-        )
+    for ac in pos_data.get("acoes_primarias", []):
+        acoes_totais.append(Acao(**ac))
         
-        feedback_erros = ""
-        if erros_validacao:
-            feedback_erros = (
-                "\n\n⚠️ INCONSISTÊNCIAS DE SOMA OPERACIONAL NO SEU LAYOUT ANTERIOR:\n"
-                + "\n".join(f"- {err}" for err in erros_validacao)
-                + "\n\nPor favor, recalcule as capacidades de destino, libere espaço e corrija suas quantidades!"
-            )
-            
-        res_posicionador = await posicionador.run(
-            f"Gere a proposta de alocação inicial baseada nas premissas de negócio.{feedback_erros}", 
-            deps=pos_deps
-        )
-        rascunho_layout_json = clean_json_string(res_posicionador.output)
-        pos_data = extrair_e_carregar_json(rascunho_layout_json)
-        
-        # Executa em sandbox temporário para validação estrita
-        sandbox_wb, sandbox_ws = clone_ws(ws)
-        acoes_totais = []
+    gabarito_dados = pos_data.get("gabarito", {})
+    
+    # FALLBACK: Se o bloco "gabarito" for omitido, reconstrói a partir das ações planejadas
+    if not gabarito_dados and "acoes_primarias" in pos_data:
+        reducoes_fallback = {}
+        novos_fallback = []
         for ac in pos_data.get("acoes_primarias", []):
-            acoes_totais.append(Acao(**ac))
-            
-        # Extração inteligente do gabarito informado pela IA
-        gabarito_dados = pos_data.get("gabarito", {})
+            tipo = ac.get("tipo", "").strip().lower()
+            cli = ac.get("cliente", "").strip()
+            qtd = ac.get("quantidade", 0)
+            if tipo == "liberar":
+                reducoes_fallback[cli] = reducoes_fallback.get(cli, 0) + qtd
+            elif tipo in ("realocar", "posicionar") and cli.upper().startswith("N_"):
+                existente = next((nc for nc in novos_fallback if nc["nome"] == cli.upper()), None)
+                if existente:
+                    existente["PAs"] += qtd
+                else:
+                    novos_fallback.append({"nome": cli.upper(), "PAs": qtd})
+        gabarito_dados = {"reducoes": reducoes_fallback, "novos_clientes": novos_fallback}
         
-        # FALLBACK: Se o bloco "gabarito" for omitido, reconstrói a partir das ações planejadas
-        if not gabarito_dados and "acoes_primarias" in pos_data:
-            reducoes_fallback = {}
-            novos_fallback = []
-            for ac in pos_data.get("acoes_primarias", []):
-                tipo = ac.get("tipo", "").strip().lower()
-                cli = ac.get("cliente", "").strip()
-                qtd = ac.get("quantidade", 0)
-                if tipo == "liberar":
-                    reducoes_fallback[cli] = reducoes_fallback.get(cli, 0) + qtd
-                elif tipo in ("realocar", "posicionar") and cli.upper().startswith("NOVO"):
-                    existente = next((nc for nc in novos_fallback if nc["nome"] == cli.upper()), None)
-                    if existente:
-                        existente["PAs"] += qtd
-                    else:
-                        novos_fallback.append({"nome": cli.upper(), "PAs": qtd})
-            gabarito_dados = {"reducoes": reducoes_fallback, "novos_clientes": novos_fallback}
-            
-        # Normaliza e formata os dados do gabarito para a auditoria (programação defensiva)
-        novos_clientes_brutos = gabarito_dados.get("novos_clientes", [])
-        novos_clientes_extraidos = []
-        for nc in novos_clientes_brutos:
-            if isinstance(nc, dict):
-                nome_orig = nc.get("nome", "")
-                pas = nc.get("PAs", 0)
-            else:
-                nome_orig = str(nc)
-                pas = 0
-            nome_norm = nome_orig.upper().strip().replace(" ", "_")
-            novos_clientes_extraidos.append({
-                "nome": nome_norm,
-                "PAs": pas
-            })
-            
-        parametros_premissas = {
-            "reducoes": {normalize_val(k): v for k, v in gabarito_dados.get("reducoes", {}).items()},
-            "novos_clientes": novos_clientes_extraidos
-        }
-            
-        # Normaliza as ações primárias antes de executar
-        acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
-            
-        proposta_inicial = PropostaMock(
-            nome=pos_data.get("nome", "Alocacao Bruta"),
-            custo_obras="Baixo",
-            acoes=acoes_totais
-        )
-        
-        log_acumulado, _ = execute_alocacao(sandbox_ws, proposta_inicial, plant_data, allowed_cells)
-        erros_validacao = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_premissas)
-        
-        if not erros_validacao:
-            print("   ✓ Layout inicial validado matematicamente com sucesso!")
-            _, _ = execute_alocacao(new_ws, proposta_inicial, plant_data, allowed_cells)
-            break
+    novos_clientes_brutos = gabarito_dados.get("novos_clientes", [])
+    novos_clientes_extraidos = []
+    for nc in novos_clientes_brutos:
+        if isinstance(nc, dict):
+            nome_orig = nc.get("nome", "")
+            pas = nc.get("PAs", 0)
         else:
-            print(f"   ❌ Tentativa {pos_iter} falhou na validação de inventário físico. Detalhes:")
-            for err in erros_validacao:
-                print(f"      -> {err}")
-            print("\n      👉 Ações tentadas nesta rodada:")
-            for ac in acoes_totais:
-                tipo = ac.tipo.upper()
-                if tipo in ('LIBERAR', 'REALOCAR', 'POSICIONAR'):
-                    print(f"         - [{tipo}] Cliente '{ac.cliente}': Qtd {ac.quantidade} no Bloco {ac.bloco}-{ac.ambiente}")
-            print()
+            nome_orig = str(nc)
+            pas = 0
+        nome_norm = nome_orig.upper().strip().replace(" ", "_")
+        novos_clientes_extraidos.append({
+            "nome": nome_norm,
+            "PAs": pas
+        })
+        
+    parametros_premissas = {
+        "reducoes": {normalize_val(k): v for k, v in gabarito_dados.get("reducoes", {}).items()},
+        "novos_clientes": novos_clientes_extraidos
+    }
+        
+    # Normaliza as ações primárias antes de executar
+    acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
+        
+    proposta_inicial = PropostaMock(
+        nome=pos_data.get("nome", "Alocacao Bruta"),
+        custo_obras="Baixo",
+        acoes=acoes_totais
+    )
+    
+    # Executa o rascunho de posicionamento bruto de soma-zero na planilha master
+    log_acumulado, _ = execute_alocacao(new_ws, proposta_inicial, plant_data, allowed_cells, file_path='planta.xlsx')
+    criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
+
+    # === INTEGRAÇÃO DO AMBIENTEBUILDER ===
+    ambientes_criados_info = []
+    if criar_ambientes_solicitados:
+        print("🛠️ Iniciando AmbienteBuilder para desenhar divisórias físicas...")
+        
+        # CORREÇÃO: Acumulador de células já consumidas por ambientes anteriores no mesmo bloco
+        # Evita sobreposição e restauração destrutiva entre iterações consecutivas
+        celulas_ja_consumidas: set = set()
+        # Mapeia bloco -> conjunto de células já alocadas (para exclusão precisa por bloco)
+        celulas_consumidas_por_bloco: dict = {}
+        
+        for amb in criar_ambientes_solicitados:
+            # Limpa o cache e força o re-scan físico a cada nova sala criada
+            import ScannerPremissas
+            ScannerPremissas._orange_context_cache = {}
+            macro_blocks_atual = scan_orange_context(dest_file, SHEET_NAME)
             
-    # Se todas as tentativas falharem, commita o rascunho imperfeito para o Organizador corrigir
-    if erros_validacao and proposta_inicial is not None:
-        print("   ⚠️ Gravando layout rascunho com inconsistências temporárias para que o Organizador realize as correções finas...")
-        _, _ = execute_alocacao(new_ws, proposta_inicial, plant_data, allowed_cells)
+            bloco_id = amb.get("bloco")
+            ambiente_letra = amb.get("ambiente")
+            qtd_mesas = amb.get("quantidade_mesas")
+            cliente_dest = amb.get("cliente_destinado")
+            sala_lugares = amb.get("sala_lugares", 0)
+            
+            env_cells_raw = set(get_env_cells(bloco_id, ambiente_letra, macro_blocks_atual))
+            
+            # CORREÇÃO: Remove as células já consumidas por ambientes anteriores no mesmo bloco
+            # para garantir que não haja sobreposição de seleção de mesas
+            consumidas_neste_bloco = celulas_consumidas_por_bloco.get(bloco_id, set())
+            env_cells = env_cells_raw - consumidas_neste_bloco
+            
+            if env_cells:
+                allocated_sala = set()
+                room_cells_override = None
+                
+                # Se for solicitada sala interna pelo Posicionador, realiza o planejamento estrutural dela
+                if sala_lugares and sala_lugares > 0:
+                    print(f"   🛠️ Planejando Sala Fechada de {sala_lugares} mesas...")
+                    allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(new_ws, env_cells, sala_lugares)
+                
+                # Seleciona as mesas do salão aberto com base no restante das células livres do bloco
+                available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
+                alternativas = gerar_alternativas_mesas(
+                    available_env_cells, new_ws, qtd_mesas
+                )
+                allocated_ambiente = alternativas[0] if alternativas else set()
+                
+                if allocated_ambiente:
+                    allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
+                    
+                    # 1. Desenha o contorno das divisórias do salão aberto
+                    # A nova lógica BFS do builder para automaticamente ao encontrar mesas de outros clientes
+                    ambiente_fisico = {"valido": False, "motivo": "sem alternativa válida"}
+                    for alternativa in alternativas:
+                        candidato_total = alternativa | (
+                            room_cells_override if room_cells_override else set()
+                        )
+                        tentativa = separar_ambiente_e_desenhar_divisorias(
+                            ws=new_ws,
+                            env_cells=env_cells,
+                            allocated_cells=candidato_total,
+                            reconstruir_sala=False,
+                            room_cells_override=room_cells_override,
+                        )
+                        if tentativa.get("valido"):
+                            allocated_ambiente = alternativa
+                            allocated_total = candidato_total
+                            ambiente_fisico = tentativa
+                            break
+                        ambiente_fisico = tentativa
+                    if not ambiente_fisico.get("valido"):
+                        print(f"   Ambiente físico inválido: {ambiente_fisico.get('motivo')}")
+                        continue
+                    
+                    # 2. Desenha o contorno interno e as mesas da sala fechada estruturada
+                    if room_cells_override:
+                        separar_ambiente_e_desenhar_divisorias(
+                            ws=new_ws, 
+                            env_cells=env_cells, 
+                            allocated_cells=allocated_sala,
+                            reconstruir_sala=True,
+                            room_cells_override=room_cells_override
+                        )
+                    
+                    # --- SINCRONIZAÇÃO DE CORES E VALORES (BUSCA GLOBAL INTEGRADA) ---
+                    fill_to_apply = None
+                    font_to_apply = None
+                    
+                    # Procura na planilha inteira pelo estilo do cliente destino (copia cor gerada na primeira etapa)
+                    for r_search in range(1, new_ws.max_row + 1):
+                        for c_search in range(1, new_ws.max_column + 1):
+                            cell_search = new_ws.cell(row=r_search, column=c_search)
+                            if cell_search.value is not None and normalize_val(cell_search.value) == normalize_val(cliente_dest):
+                                fill_to_apply = copy(cell_search.fill) if cell_search.has_style else None
+                                font_to_apply = copy(cell_search.font) if cell_search.has_style else None
+                                break
+                        if fill_to_apply:
+                            break
+                            
+                    # Caso seja um cliente inédito ainda sem estilo, aplica a paleta padrão
+                    if not fill_to_apply:
+                        paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
+                        idx = 0
+                        for i, nc in enumerate(parametros_premissas["novos_clientes"]):
+                            if nc["nome"] == cliente_dest:
+                                idx = i
+                                break
+                        cor_hex = paleta_cores[idx % len(paleta_cores)]
+                        fill_to_apply = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
+                        font_to_apply = Font(color='FFFFFF', bold=True, size=8)
+
+                    # Preenche os assentos do salão aberto
+                    for r, c in allocated_ambiente:
+                        cell = new_ws.cell(row=r, column=c)
+                        if cell.value != "CT":
+                            cell.value = cliente_dest
+                            cell.fill = fill_to_apply
+                            cell.font = font_to_apply
+                    
+                    # Preenche mesas da sala de reunião com estilo visual "vazio" cinza (indicando assentos de reunião)
+                    if room_cells_override:
+                        fill_sala = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
+                        font_sala = Font(name="Calibri", size=9)
+                        for r, c in allocated_sala:
+                            cell = new_ws.cell(row=r, column=c)
+                            if cell.value != "CT":
+                                cell.value = "vazio"
+                                cell.fill = fill_sala
+                                cell.font = font_sala
+
+                    # CORREÇÃO: Registra TODAS as células consumidas nesta iteração no acumulador
+                    # Registra apenas as mesas alocadas efetivamente — não o envelope inteiro
+                    all_allocated_cells = (
+                        allocated_ambiente
+                        | (allocated_sala if allocated_sala else set())
+                        | ambiente_fisico.get("relocated_cells", set())
+                    )
+                    celulas_ja_consumidas.update(all_allocated_cells)
+                    celulas_consumidas_por_bloco.setdefault(bloco_id, set()).update(
+                        ambiente_fisico["room_cells"]
+                        | ambiente_fisico.get("relocated_cells", set())
+                    )
+                    
+                    # Restaura as demais células do bloco que não foram consumidas para o snapshot original
+                    # CORREÇÃO: Protege células de ambientes criados em iterações ANTERIORES contra restauração
+                    for r, c in env_cells:
+                        if (r, c) not in all_allocated_cells and (r, c) not in celulas_ja_consumidas:
+                            cell = new_ws.cell(row=r, column=c)
+                            if cell.value != "CT":
+                                snap = original_snapshot.get((r, c))
+                                if snap:
+                                    cell.value = snap['value']
+                                    if snap['fill']: cell.fill = snap['fill']
+                                    if snap['font']: cell.font = snap['font']
+
+                    ambientes_criados_info.append(
+                        f"- Criado Novo Ambiente Fechado no Bloco '{bloco_id}', Ambiente '{ambiente_letra}' "
+                        f"com {len(allocated_ambiente)} PAs operacionais"
+                        + (f" + sala fechada de {len(allocated_sala)} lugares" if allocated_sala else "")
+                        + f" para o cliente '{cliente_dest}'."
+                    )
+                    print(f"   ✓ Divisórias físicas desenhadas no bloco {bloco_id}-{ambiente_letra}!")
+                    
+                    # Salva imediatamente após desenhar cada sala para persistir no disco para a próxima iteração
+                    new_wb.save(dest_file)
+                else:
+                    print(f"   ⚠️ Nenhuma mesa contígua encontrada para criar sala no {bloco_id}-{ambiente_letra}.")
+            else:
+                print(f"   ⚠️ Bloco/Ambiente '{bloco_id}-{ambiente_letra}' não localizado para o AmbienteBuilder.")
+
+    # Salva a planilha intermediária (para garantir as alterações físicas das paredes)
+    new_wb.save(dest_file)
+
+    # === RECONCILIAÇÃO MATEMÁTICA DE INVENTÁRIO (GARANTE SOMA ZERO) ===
+    print("⚖️ Reconciliando inventário global para garantir consistência física...")
+    
+    # 1. Popular estilos de preenchimento e fontes dos clientes (Busca unificada e robusta)
+    client_fills = {}
+    client_fonts = {}
+    
+    # Primeiro busca na original para ter os estilos dos estáveis/reduzidos
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r, column=c)
+            v = cell.value
+            if v is not None:
+                norm_v = normalize_val(v)
+                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
+                    if cell.fill and cell.fill.patternType == 'solid':
+                        client_fills[norm_v] = copy(cell.fill)
+                    if cell.font:
+                        client_fonts[norm_v] = copy(cell.font)
+                        
+    # Depois busca na modificada para capturar os estilos gerados pelo LayoutEngine para novos clientes
+    for r in range(1, new_ws.max_row + 1):
+        for c in range(1, new_ws.max_column + 1):
+            cell = new_ws.cell(row=r, column=c)
+            v = cell.value
+            if v is not None:
+                norm_v = normalize_val(v)
+                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
+                    if cell.fill and cell.fill.patternType == 'solid':
+                        client_fills[norm_v] = copy(cell.fill)
+                    if cell.font:
+                        client_fonts[norm_v] = copy(cell.font)
+
+    paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
+    default_new_fills = {}
+    default_new_fonts = {}
+    for idx, nc in enumerate(parametros_premissas["novos_clientes"]):
+        nome = nc["nome"]
+        cor_hex = paleta_cores[idx % len(paleta_cores)]
+        default_new_fills[nome] = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
+        default_new_fonts[nome] = Font(color='FFFFFF', bold=True, size=8)
+
+    # 2. Determinar as metas esperadas (targets) de cada cliente
+    expected_targets = {}
+    orig_counts = {}
+    for r in range(1, ws.max_row + 1):
+        for c in range(1, ws.max_column + 1):
+            if (r, c) not in allowed_cells:
+                continue
+            val = ws.cell(row=r, column=c).value
+            if val is not None:
+                norm_val = normalize_val(val)
+                if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
+                    orig_counts[norm_val] = orig_counts.get(norm_val, 0) + 1
+                    
+    for client, qty in orig_counts.items():
+        if client in parametros_premissas["reducoes"]:
+            expected_targets[client] = qty - parametros_premissas["reducoes"][client]
+        else:
+            expected_targets[client] = qty
+        
+    # MODIFICAÇÃO: Deduz as mesas em branco das salas de reunião da contagem de mesas ativas exigidas
+    for nc in parametros_premissas["novos_clientes"]:
+        nome = nc["nome"]
+        target_pas = nc["PAs"]
+        for amb in criar_ambientes_solicitados:
+            if amb.get("cliente_destinado") == nome:
+                target_pas -= amb.get("sala_lugares", 0)
+        expected_targets[nome] = target_pas
+        
+    # 3. Mapear as coordenadas das novas salas com base na presença física do cliente destino
+    room_cells_by_client = {}
+    if criar_ambientes_solicitados:
+        import ScannerPremissas
+        ScannerPremissas._orange_context_cache = {}
+        macro_blocks_reconcile = scan_orange_context(dest_file, SHEET_NAME)
+        for amb in criar_ambientes_solicitados:
+            bloco_id = amb.get("bloco")
+            cliente_dest = amb.get("cliente_destinado")
+            
+            block_match = re.search(r'\d+', str(bloco_id))
+            if block_match:
+                block_idx = int(block_match.group())
+                if block_idx <= len(macro_blocks_reconcile):
+                    block = macro_blocks_reconcile[block_idx - 1]
+                    for env in block.get('ambientes', []):
+                        client_presence = sum(
+                            1 for coord in env['cells'] 
+                            if new_ws.cell(row=coord[0], column=coord[1]).value == cliente_dest
+                        )
+                        if client_presence > 0:
+                            room_cells_by_client.setdefault(cliente_dest, set()).update(env['cells'])
+
+    # 4. Obter contagem atual na planilha modificada
+    def get_actual_counts(sheet):
+        counts = {}
+        for r in range(1, sheet.max_row + 1):
+            for c in range(1, sheet.max_column + 1):
+                if (r, c) not in allowed_cells:
+                    continue
+                val = sheet.cell(row=r, column=c).value
+                if val is not None:
+                    norm_val = normalize_val(val)
+                    if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
+                        counts[norm_val] = counts.get(norm_val, 0) + 1
+        return counts
+
+    actual_counts = get_actual_counts(new_ws)
+    
+    # 5. Ajustar excessos (limpar duplicatas criadas fora das salas físicas oficiais)
+    for client, target in expected_targets.items():
+        actual = actual_counts.get(client, 0)
+        if actual > target:
+            diff = actual - target
+            client_cells = []
+            for r in range(1, new_ws.max_row + 1):
+                for c in range(1, new_ws.max_column + 1):
+                    if (r, c) not in allowed_cells:
+                        continue
+                    val = new_ws.cell(row=r, column=c).value
+                    if val is not None and normalize_val(val) == client:
+                        dedicated_cells = room_cells_by_client.get(client, set())
+                        if (r, c) not in dedicated_cells:
+                            client_cells.append((r, c))
+            
+            for r, c in sorted(client_cells, key=lambda x: (x[1], x[0]))[:diff]:
+                new_ws.cell(row=r, column=c).value = 'vazio'
+                new_ws.cell(row=r, column=c).fill = FILL_LIBERADO
+                new_ws.cell(row=r, column=c).font = FONT_SMALL
+            
+    # Re-computa contagens antes de suprir déficits
+    actual_counts = get_actual_counts(new_ws)
+    
+    # 6. Ajustar déficits (alocar assentos em vazios aplicando os estilos corretos preservados)
+    for client, target in expected_targets.items():
+        actual = actual_counts.get(client, 0)
+        if actual < target:
+            diff = target - actual
+            vazio_cells = []
+            for r in range(1, new_ws.max_row + 1):
+                for c in range(1, new_ws.max_column + 1):
+                    if (r, c) not in allowed_cells:
+                        continue
+                    val = new_ws.cell(row=r, column=c).value
+                    if val is None or normalize_val(val) in ('VAZIO', ''):
+                        vazio_cells.append((r, c))
+            
+            vazio_cells.sort(key=lambda x: (x[1], x[0]))
+            
+            fill_to_apply = client_fills.get(client) or default_new_fills.get(client, FILL_NEW_CLIENT)
+            font_to_apply = client_fonts.get(client) or default_new_fonts.get(client) or (FONT_WHITE if client.startswith("N_") else FONT_SMALL)
+            
+            for r, c in vazio_cells[:diff]:
+                new_ws.cell(row=r, column=c).value = client
+                new_ws.cell(row=r, column=c).fill = fill_to_apply
+                new_ws.cell(row=r, column=c).font = font_to_apply
+                
+    # Salva a planilha reconciliada final
+    new_wb.save(dest_file)
+    print("⚖️ Inventário reconciliado com sucesso! Iniciando validação física...")
+
+    # Re-scan dos blocos e paredes laranjas (ScannerPremissas) para forçar o remapeamento dinâmico
+    import ScannerPremissas
+    ScannerPremissas._orange_context_cache = {}
+    
+    # Ajusta os parâmetros de validação para que desconsidere as mesas em branco das salas de reunião
+    adjusted_novos_clientes = []
+    for nc in parametros_premissas["novos_clientes"]:
+        nome = nc["nome"]
+        pas_originais = nc["PAs"]
+        # Deduz os assentos em branco das salas de reunião correspondentes
+        for amb in criar_ambientes_solicitados:
+            if amb.get("cliente_destinado") == nome:
+                pas_originais -= amb.get("sala_lugares", 0)
+        adjusted_novos_clientes.append({
+            "nome": nome,
+            "PAs": pas_originais
+        })
+        
+    parametros_validacao = {
+        "reducoes": parametros_premissas["reducoes"],
+        "novos_clientes": adjusted_novos_clientes
+    }
+    
+    ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
+    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_validacao)
 
     # Salva auditoria do posicionador
     salvar_auditoria("1_posicionador", (
         f"[PREMISSAS DO TXT]\n{pos_deps.premissas}\n\n"
         f"[BLOCOS INFO]\n{pos_deps.blocos_info}\n\n"
-        f"[PLANT INFO]\n{pos_deps.plant_info}"
+        f"[PLANT INFO]\n{pos_deps.plant_info}\n\n"
+        f"[ACOES PLANEJADAS]\n{rascunho_layout_json}"
     ), res_posicionador.output, safe_name)
 
-    if erros_validacao:
-        print("⚠ Layout inicial possui erros não resolvidos pelo Posicionador. Entrando no loop do Organizador...")
-    else:
-        print("Iniciando loop de otimização espacial do Organizador...")
+    # ══════════════════════════════════════════════════════════════════════════
+    # ETAPA 2: Loop de Auto-Correção e Swaps via Organizador
+    # ══════════════════════════════════════════════════════════════════════════
+    print("2. Organizador iniciando loop de alinhamento e swaps...")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # ETAPA 2: Loop de Auto-Correção e Swaps Estáveis com o Organizador (Máx 3 Iterações)
-    # ══════════════════════════════════════════════════════════════════════════
-    print("\n2. Iniciando Loop de Auto-Correção do Organizador (Máximo 3 Iterações)...")
-    
     for iteracao in range(1, 4):
-        print(f"--- Iteração {iteracao}/3 ---")
+        print(f"   -> Tentativa do Organizador {iteracao}/3...")
         
-        current_plant_data = scan_plant(new_ws, FORBIDDEN_PATTERNS)
-        current_plant_info = build_plant_info(current_plant_data)
-        current_blocos_info = build_blocos_info(current_plant_data, new_ws.max_row, new_ws.max_column, new_ws)
+        try:
+            # O scan de blocos físicos é refeito de forma dinâmica na planilha modificada pelo AmbienteBuilder
+            current_wb = openpyxl.load_workbook(dest_file)
+            current_ws = current_wb[SHEET_NAME]
+            
+            current_plant_data = scan_plant(current_ws, FORBIDDEN_PATTERNS)
+            current_plant_info = build_plant_info(current_plant_data)
+            
+            # Chamada passando o caminho dinâmico do arquivo modificado
+            current_blocos_info = build_blocos_info(
+                current_plant_data, 
+                current_ws.max_row, 
+                current_ws.max_column, 
+                current_ws, 
+                file_path=dest_file
+            )
+        except Exception as e:
+            print(f"\n❌ ERRO DETECTADO NA PREPARAÇÃO DA TENTATIVA {iteracao}:")
+            traceback.print_exc()
+            return
         
         org_deps = OrganizadorDeps(
             plant_info=current_plant_info,
             blocos_info=current_blocos_info,
             premissas=premissas_completas,
-            rascunho_layout=rascunho_layout_json
+            rascunho_layout=rascunho_layout_json,
+            ambientes_criados=ambientes_criados_str
         )
         
         feedback_erros = ""
@@ -233,17 +619,18 @@ async def main():
             feedback_erros = (
                 "\n\n⚠️ INCONSISTÊNCIAS DE SOMA OPERACIONAL NO LAYOUT ATUAL:\n"
                 + "\n".join(f"- {err}" for err in erros_validacao)
-                + "\n\nAplique ações de 'transferir' para reequilibrar as quantidades exatas de volta!"
+                + "\n\nAplique ações de 'transferir' (permutas/swaps) para reequilibrar as quantidades exatas de volta!"
             )
         
         res_organizador = await organizador.run(
-            f"Avalie a planta física atual. Se houver qualquer violação de premissas (como unificação, exclusividade, Cliente 7 compartilhado), utilize a função 'transferir' para corrigir. Se estiver tudo certo, retorne a lista vazia.{feedback_erros}",
+            f"Avalie a planta física atual. Se houver qualquer violação de premissas (como unificação, exclusividade, novo cliente desalinhado de sua sala física), utilize a função 'transferir' para corrigir. Se estiver tudo certo, retorne a lista vazia.{feedback_erros}",
             deps=org_deps
         )
         reorganizacao_json = clean_json_string(res_organizador.output)
         
         salvar_auditoria(f"2_organizador_iter{iteracao}", (
             f"[RASCUNHO DO LAYOUT]\n{org_deps.rascunho_layout}\n\n"
+            f"[AMBIENTES RECENTEMENTE CRIADOS]\n{org_deps.ambientes_criados}\n\n"
             f"[PREMISSAS DO TXT]\n{org_deps.premissas}\n\n"
             f"[BLOCOS INFO ATUALIZADOS NA PLANILHA FISICA]\n{org_deps.blocos_info}\n\n"
             f"[PLANT INFO ATUALIZADA]\n{org_deps.plant_info}"
@@ -256,7 +643,7 @@ async def main():
             print(f"✓ Sistema auditado e validado. Todas as premissas e inventários estão plenamente satisfatórios!")
             break
             
-        print(f"⚠ Executando ações de correção em sandbox para validação de integridade...")
+        print(f"   ⚠ Validando ações corretivas em sandbox...")
         
         acoes_iteracao = []
         for ac in acoes_org:
@@ -267,13 +654,14 @@ async def main():
         proposta_correcao = PropostaMock(f"Swaps Iteracao {iteracao}", "Baixo", acoes_iteracao)
         
         sandbox_wb, sandbox_ws = clone_ws(new_ws)
-        log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells)
+        log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells, file_path=dest_file)
         
-        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_premissas)
+        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_validacao)
         
         if not erros_validacao_temp:
-            print(f"✓ Correção da Iteração {iteracao} validada com sucesso! Gravando no Excel master...")
-            log_iter, _ = execute_alocacao(new_ws, proposta_correcao, current_plant_data, allowed_cells)
+            print(f"   ✓ Correção da Iteração {iteracao} validada com sucesso! Consolidando alterações físicas...")
+            # Consolida usando o caminho físico dinâmico
+            log_iter, _ = execute_alocacao(new_ws, proposta_correcao, current_plant_data, allowed_cells, file_path=dest_file)
             
             for k, v in log_iter.get('realocadas', {}).items():
                 log_acumulado.setdefault('realocadas', {}).setdefault(k, []).extend(v)
@@ -282,17 +670,15 @@ async def main():
             log_acumulado.setdefault('avisos', []).extend(log_iter.get('avisos', []))
             acoes_totais.extend(acoes_iteracao)
             erros_validacao = []  
+            
+            # Salva o arquivo intermediário após a rodada bem sucedida
+            new_wb.save(dest_file)
         else:
-            print(f"❌ Correção inválida na Iteração {iteracao}. Executando rollback. Detalhes:")
+            print(f"   ❌ Correção inválida na Iteração {iteracao}. Executando rollback...")
+            print("\n      ⚠️ DETALHES DAS INCONSISTÊNCIAS NO LAYOUT DO ORGANIZADOR:")
             for err in erros_validacao_temp:
-                print(f"   -> {err}")
-            print("\n   👉 Ações que a LLM tentou executar nesta rodada:")
-            for ac in acoes_org:
-                tipo = ac.get('tipo', '').strip().lower()
-                if tipo in ('liberar', 'realocar', 'posicionar'):
-                    print(f"      - [{tipo.upper()}] Cliente '{ac.get('cliente', '')}': Qtd {ac.get('quantidade', 0)} no Bloco {ac.get('bloco', '')}-{ac.get('ambiente', '')}")
-                elif tipo in ('transferir', 'swap', 'permutar'):
-                    print(f"      - [TRANSFERIR] '{ac.get('cliente_a', '')}' ({ac.get('quantidade_a', 0)} PAs de {ac.get('bloco_a', '')}-{ac.get('ambiente_a', '')}) <-> '{ac.get('cliente_b', '')}' ({ac.get('quantidade_b', 0)} PAs de {ac.get('bloco_b', '')}-{ac.get('ambiente_b', '')})")
+                print(f"      -> {err}")
+            print()
             erros_validacao = erros_validacao_temp  
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -302,7 +688,7 @@ async def main():
     new_wb.save(dest_file)
     
     final_plant_data = scan_plant(new_ws, FORBIDDEN_PATTERNS)
-    final_blocos_info = build_blocos_info(final_plant_data, new_ws.max_row, new_ws.max_column, new_ws)
+    final_blocos_info = build_blocos_info(final_plant_data, new_ws.max_row, new_ws.max_column, new_ws, file_path=dest_file)
     
     print("\n================================================================================")
     print("ESTADO FINAL DOS BLOCOS APÓS TODAS AS MOVIMENTAÇÕES E CORREÇÕES:")
@@ -324,10 +710,7 @@ async def main():
         f.write("================================================================================\n\n")
         f.write(final_blocos_info)
         
-    print(f"✓ Processo concluído com sucesso. Arquivos gravados em 'propostas/':")
-    print(f"  - Excel modificado: proposta_final.xlsx")
-    print(f"  - Lista de mudanças: proposta_final_mudancas.txt")
-    print(f"  - Mapa final de blocos: proposta_final_blocos_finais.txt")
+    print(f"✓ Processo concluído com sucesso. Arquivos gravados em 'propostas/'.")
 
 if __name__ == '__main__':
     asyncio.run(main())
