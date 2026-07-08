@@ -302,14 +302,14 @@ async def main():
                             cell.fill = fill_to_apply
                             cell.font = font_to_apply
                             
-                    # Preenche os assentos da sala estruturada interna
+                    # MODIFICAÇÃO: Mantém as mesas internas da sala de reunião completamente apagadas/limpas
                     if room_cells_override:
                         for r, c in allocated_sala:
                             cell = new_ws.cell(row=r, column=c)
                             if cell.value != "CT":
-                                cell.value = cliente_dest
-                                cell.fill = fill_to_apply
-                                cell.font = font_to_apply
+                                cell.value = ""  # Sem escrita
+                                cell.fill = PatternFill(fill_type=None)  # Sem preenchimento
+                                cell.font = Font(name="Calibri", size=9)
 
                     # Restaura as demais células do bloco que não foram consumidas para o snapshot original
                     all_allocated_cells = allocated_ambiente | (allocated_sala if allocated_sala else set())
@@ -402,11 +402,16 @@ async def main():
         else:
             expected_targets[client] = qty
         
+    # MODIFICAÇÃO: Deduz as mesas em branco das salas de reunião da contagem de mesas ativas exigidas
     for nc in parametros_premissas["novos_clientes"]:
-        expected_targets[nc["nome"]] = nc["PAs"]
+        nome = nc["nome"]
+        target_pas = nc["PAs"]
+        for amb in criar_ambientes_solicitados:
+            if amb.get("cliente_destinado") == nome:
+                target_pas -= amb.get("sala_lugares", 0)
+        expected_targets[nome] = target_pas
         
     # 3. Mapear as coordenadas das novas salas com base na presença física do cliente destino
-    # Isso torna o mapeamento e reconciliação completamente imunes a colisões
     room_cells_by_client = {}
     if criar_ambientes_solicitados:
         import ScannerPremissas
@@ -501,8 +506,27 @@ async def main():
     import ScannerPremissas
     ScannerPremissas._orange_context_cache = {}
     
+    # Ajusta os parâmetros de validação para que desconsidere as mesas em branco das salas de reunião
+    adjusted_novos_clientes = []
+    for nc in parametros_premissas["novos_clientes"]:
+        nome = nc["nome"]
+        pas_originais = nc["PAs"]
+        # Deduz os assentos em branco das salas de reunião correspondentes
+        for amb in criar_ambientes_solicitados:
+            if amb.get("cliente_destinado") == nome:
+                pas_originais -= amb.get("sala_lugares", 0)
+        adjusted_novos_clientes.append({
+            "nome": nome,
+            "PAs": pas_originais
+        })
+        
+    parametros_validacao = {
+        "reducoes": parametros_premissas["reducoes"],
+        "novos_clientes": adjusted_novos_clientes
+    }
+    
     ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
-    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_premissas)
+    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_validacao)
 
     # Salva auditoria do posicionador
     salvar_auditoria("1_posicionador", (
@@ -591,7 +615,7 @@ async def main():
         sandbox_wb, sandbox_ws = clone_ws(new_ws)
         log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells, file_path=dest_file)
         
-        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_premissas)
+        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_validacao)
         
         if not erros_validacao_temp:
             print(f"   ✓ Correção da Iteração {iteracao} validada com sucesso! Consolidando alterações físicas...")

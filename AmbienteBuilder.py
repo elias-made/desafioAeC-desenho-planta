@@ -940,13 +940,13 @@ def separar_ambiente_e_desenhar_divisorias(
 
     if reconstruir_sala:
         for r, c in room_cells:
+            # Se a célula está dentro da sala física, mas não é uma das mesas planejadas para ela:
             if (r, c) not in target_bench_cells and (r, c) != cell_ct_coord:
                 if not _eh_pilar_ou_coluna(ws, r, c) and not _eh_celula_mesclada(ws, r, c):
                     cell = ws.cell(row=r, column=c)
-                    cell.value = ""
-                    cell.fill = PatternFill(fill_type=None)
-                    # Reseta as bordas internas de corredores para não herdar vestígios
-                    cell.border = Border()
+                    cell.value = ""                         # <--- Esvazia o texto/nome completamente
+                    cell.fill = PatternFill(fill_type=None) # <--- Remove cores residuais
+                    cell.border = Border()                  # <--- Limpa as bordas internas
 
     for r, c in room_cells:
         if (r - 1, c) not in room_cells:
