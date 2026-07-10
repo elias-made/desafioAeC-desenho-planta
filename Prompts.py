@@ -89,10 +89,29 @@ Sua missão única é organizar o layout de acordo com as premissas utilizando e
 == MAPA DOS BLOCOS FÍSICOS (ATUALIZADO COM OS NOVOS LIMITES E PAREDES) ==
 {blocos_info}
 
+== REGRA CRÍTICA SOBRE NOVOS AMBIENTES ==
+ATENÇÃO: O motor físico (AmbienteBuilder) JÁ posicionou os novos clientes DENTRO das divisórias criadas.
+Após a criação das divisórias, o scanner RE-ESCANEIA o bloco e as LETRAS DOS AMBIENTES PODEM MUDAR.
+
+Exemplo: O posicionador solicitou "criar N_1 no Bloco_7-B", mas após criar as divisórias:
+- O scanner pode detectar o novo ambiente como Bloco_7-A, Bloco_7-C, ou qualquer outra letra
+- Isso é NORMAL e esperado
+
+COMO VERIFICAR SE UM NOVO CLIENTE ESTÁ CORRETO:
+1. Verifique se o cliente está no BLOCO correto (ignore a letra do ambiente)
+2. Verifique se a QUANTIDADE de PAs está correta
+3. Se ambos estiverem corretos, NÃO FAÇA SWAP - o cliente já está no lugar certo!
+
+QUANDO FAZER SWAP:
+- Apenas quando houver violação real de premissas (exclusividade, unificação)
+- Apenas quando um cliente estiver no BLOCO errado
+- NUNCA faça swap apenas porque a letra do ambiente mudou
+
 == DIRETRIZES DE ATUAÇÃO (OBRIGATÓRIO) ==
 1. APENAS ORGANIZAR: Você NÃO pode criar novos clientes do zero ou alterar o inventário total (reduções/criações). Sua única função é mover pessoas para respeitar as regras (unificação, exclusividade de blocos, ou colocar novos clientes dentro de suas salas físicas recém-criadas).
 2. FUNÇÃO ÚNICA: Utilize estritamente o tipo `"transferir"` em suas ações. Não utilize `"liberar"` ou `"realocar"`.
 3. CONFIANÇA DO MAPA: Baseie-se unicamente no `{blocos_info}` para saber a posição física real de cada cliente antes de realizar uma transferência.
+4. NOVOS CLIENTES JÁ POSICIONADOS: Os novos clientes (N_1, N_2, N_3...) já foram posicionados pelo motor físico dentro de suas divisórias. Se a quantidade deles no BLOCO está correta, não faça swap.
 
 == FORMATO OBRIGATÓRIO DE RETORNO (JSON PURO) ==
 {{

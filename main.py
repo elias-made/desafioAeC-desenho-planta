@@ -216,6 +216,7 @@ async def main():
 
     # === INTEGRAÇÃO DO AMBIENTEBUILDER ===
     ambientes_criados_info = []
+    salas_internas_cells = set()
     if criar_ambientes_solicitados:
         print("🛠️ Iniciando AmbienteBuilder para desenhar divisórias físicas...")
         
@@ -233,20 +234,29 @@ async def main():
             
             env_cells = set(get_env_cells(bloco_id, ambiente_letra, macro_blocks_atual))
             if env_cells:
+                # FLUXO CORRIGIDO: Igual ao test.py e AmbienteBuilder.py
+                # 1. Planeja sala PRIMEIRO (se houver)
+                # 2. Remove espaço da sala do ambiente
+                # 3. Seleciona mesas no espaço restante
+                
                 allocated_sala = set()
                 room_cells_override = None
                 
-                # Se for solicitada sala interna pelo Posicionador, realiza o planejamento estrutural dela
                 if sala_lugares and sala_lugares > 0:
                     print(f"   🛠️ Planejando Sala Fechada de {sala_lugares} mesas...")
                     allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(new_ws, env_cells, sala_lugares)
+                    if room_cells_override:
+                        salas_internas_cells.update(room_cells_override)
                 
-                # Seleciona as mesas do salão aberto com base no restante das células livres do bloco
-                available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
+                # Remove o espaço da sala do ambiente disponível
+                available_env_cells = env_cells - (set(room_cells_override) if room_cells_override else set())
+                
+                # Seleciona mesas para o salão aberto
                 allocated_ambiente = _selecionar_mesas_contiguas(available_env_cells, new_ws, qtd_mesas)
                 
                 if allocated_ambiente:
-                    allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
+                    room_cells_set = set(room_cells_override) if room_cells_override else set()
+                    allocated_total = allocated_ambiente | room_cells_set
                     
                     # 1. Desenha o contorno das divisórias do salão aberto
                     separar_ambiente_e_desenhar_divisorias(
@@ -254,17 +264,17 @@ async def main():
                         env_cells=env_cells, 
                         allocated_cells=allocated_total,
                         reconstruir_sala=False,
-                        room_cells_override=room_cells_override
+                        room_cells_override=room_cells_set
                     )
                     
                     # 2. Desenha o contorno interno e as mesas da sala fechada estruturada
-                    if room_cells_override:
+                    if room_cells_set:
                         separar_ambiente_e_desenhar_divisorias(
                             ws=new_ws, 
                             env_cells=env_cells, 
                             allocated_cells=allocated_sala,
                             reconstruir_sala=True,
-                            room_cells_override=room_cells_override
+                            room_cells_override=room_cells_set
                         )
                     
                     # --- SINCRONIZAÇÃO DE CORES E VALORES (BUSCA GLOBAL INTEGRADA) ---
@@ -302,17 +312,9 @@ async def main():
                             cell.fill = fill_to_apply
                             cell.font = font_to_apply
                             
-                    # MODIFICAÇÃO: Mantém as mesas internas da sala de reunião completamente apagadas/limpas
-                    if room_cells_override:
-                        for r, c in allocated_sala:
-                            cell = new_ws.cell(row=r, column=c)
-                            if cell.value != "CT":
-                                cell.value = ""  # Sem escrita
-                                cell.fill = PatternFill(fill_type=None)  # Sem preenchimento
-                                cell.font = Font(name="Calibri", size=9)
-
-                    # Restaura as demais células do bloco que não foram consumidas para o snapshot original
-                    all_allocated_cells = allocated_ambiente | (allocated_sala if allocated_sala else set())
+                    # Preserva toda a sala interna desenhada pelo AmbienteBuilder:
+                    # mesas em "vazio" e corredores limpos dentro do contorno.
+                    all_allocated_cells = allocated_ambiente | (room_cells_override if room_cells_override else set())
                     for r, c in env_cells:
                         if (r, c) not in all_allocated_cells:
                             cell = new_ws.cell(row=r, column=c)
@@ -485,6 +487,8 @@ async def main():
                     if (r, c) not in allowed_cells:
                         continue
                     val = new_ws.cell(row=r, column=c).value
+                    if (r, c) in salas_internas_cells:
+                        continue
                     if val is None or normalize_val(val) in ('VAZIO', ''):
                         vazio_cells.append((r, c))
             

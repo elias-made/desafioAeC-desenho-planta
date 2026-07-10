@@ -108,7 +108,8 @@ def _eh_faixa_livre(ws, env_cells: Set[Tuple[int, int]], r0, r1, c0, c1) -> bool
             cell = ws.cell(row=r, column=c)
             val = str(cell.value).strip().upper() if cell.value is not None else ""
             
-            if _eh_celula_de_mesa_local(cell) or val.startswith("N_"):
+            # CORREÇÃO: Células de outros clientes (N_*) ou salas (vazio) não são livres
+            if _eh_celula_de_mesa_local(cell) or val.startswith("N_") or val == "VAZIO":
                 return False
             
             eh_nossa_catraca = False
@@ -226,7 +227,10 @@ def _expandir_corredor_para_acessibilidade(
     desk_cells: Set[Tuple[int, int]],
     mesas_sem_saida: Set[Tuple[int, int]]
 ) -> Set[Tuple[int, int]]:
-    """Tenta expandir o room_cells adicionando corredores para conectar mesas isoladas."""
+    """Tenta expandir o room_cells adicionando corredores para conectar mesas isoladas.
+    
+    IMPORTANTE: Respeita divisórias desenhadas anteriormente (células com valor "N_" ou bordas laranjas).
+    """
     from collections import deque
     
     corridor_cells = room_cells - desk_cells
@@ -269,7 +273,13 @@ def _expandir_corredor_para_acessibilidade(
                 continue
             if (nr, nc) not in env_cells:
                 continue
+            # CORREÇÃO: Não cruza paredes laranjas de ambientes anteriores
             if _tem_parede_laranja_entre(ws, mr, mc, nr, nc):
+                continue
+            # CORREÇÃO: Não cruza células de outros clientes (N_1, N_2, etc)
+            cell_adj = ws.cell(row=nr, column=nc)
+            val_adj = str(cell_adj.value).strip().upper() if cell_adj.value else ""
+            if val_adj.startswith("N_") or val_adj in ("CT", "vazio"):
                 continue
             if _eh_pilar_ou_coluna(ws, nr, nc):
                 continue
@@ -302,7 +312,13 @@ def _expandir_corredor_para_acessibilidade(
                     continue
                 if (nr, nc) not in env_cells:
                     continue
+                # CORREÇÃO: Não cruza paredes laranjas
                 if _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                    continue
+                # CORREÇÃO: Não cruza células de outros clientes
+                cell_next = ws.cell(row=nr, column=nc)
+                val_next = str(cell_next.value).strip().upper() if cell_next.value else ""
+                if val_next.startswith("N_") or val_next in ("CT", "vazio"):
                     continue
                 if _eh_pilar_ou_coluna(ws, nr, nc):
                     continue
@@ -320,7 +336,10 @@ def _expandir_corredor_para_acessibilidade(
 
 
 def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
-    """Absorve frestas de 1 a 2 células de largura contra as paredes para evitar novos contornos flutuantes."""
+    """Absorve frestas de 1 a 2 células de largura contra as paredes para evitar novos contornos flutuantes.
+    
+    IMPORTANTE: Respeita células de outros clientes (N_1, N_2, etc).
+    """
     room_cells = set(room_cells)
     changed = True
     while changed:
@@ -328,6 +347,12 @@ def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Se
         remaining = env_cells - room_cells
         to_absorb = set()
         for r, c in remaining:
+            # CORREÇÃO: Não absorve células de outros clientes
+            cell = ws.cell(row=r, column=c)
+            val = str(cell.value).strip().upper() if cell.value else ""
+            if val.startswith("N_") or val in ("CT", "vazio"):
+                continue
+                
             adj_to_room = False
             for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
                 if (r + dr, c + dc) in room_cells:
@@ -345,6 +370,12 @@ def _absorver_gaps_estreitos(ws, env_cells: Set[Tuple[int, int]], room_cells: Se
                         curr_r += dr
                         curr_c += dc
                         if (curr_r, curr_c) not in env_cells or _tem_parede_laranja_entre(ws, curr_r - dr, curr_c - dc, curr_r, curr_c):
+                            is_blocked = True
+                            break
+                        # CORREÇÃO: Verifica se célula atual é de outro cliente
+                        cell_curr = ws.cell(row=curr_r, column=curr_c)
+                        val_curr = str(cell_curr.value).strip().upper() if cell_curr.value else ""
+                        if val_curr.startswith("N_") or val_curr in ("CT", "vazio"):
                             is_blocked = True
                             break
                         if (curr_r, curr_c) in room_cells:
@@ -699,10 +730,26 @@ def separar_ambiente_e_desenhar_divisorias(
     border_color: str = "FF9900",
     reconstruir_sala: bool = False,
     room_cells_override: Set[Tuple[int, int]] = None
-):
-    """Desenha as divisórias ao redor das bancadas e suporta a criação de salas estruturadas."""
+) -> dict:
+    """
+    Desenha as divisórias ao redor das bancadas e suporta a criação de salas estruturadas.
+    
+    Returns:
+        dict com valido, motivo, room_cells, corridor_cells, ct_cell, mesas_sem_saida, relocated_cells
+    """
+    resultado = {
+        "valido": False,
+        "motivo": "",
+        "room_cells": set(),
+        "corridor_cells": set(),
+        "ct_cell": None,
+        "mesas_sem_saida": set(),
+        "relocated_cells": set()
+    }
+    
     if not allocated_cells or not env_cells:
-        return
+        resultado["motivo"] = "sem células alocadas ou ambiente"
+        return resultado
 
     from BlockMapper import flood_fill
 
@@ -750,7 +797,11 @@ def separar_ambiente_e_desenhar_divisorias(
                 continue
             cell = ws.cell(row=r, column=c)
             val_str = str(cell.value).strip().upper() if cell.value is not None else ""
-            if _eh_celula_de_mesa_local(cell) or (r, c) in allocated or val_str.startswith("N_"):
+            # CORREÇÃO: Só inclui célula se pertence ao cliente atual OU é mesa livre
+            # NÃO inclui células de OUTROS clientes (N_1, N_2, etc)
+            if (r, c) in allocated:
+                all_desks_in_env.add((r, c))
+            elif _eh_celula_de_mesa_local(cell) and not val_str.startswith("N_"):
                 all_desks_in_env.add((r, c))
 
         benches = flood_fill(all_desks_in_env)
@@ -903,16 +954,23 @@ def separar_ambiente_e_desenhar_divisorias(
 
         # Verificação de acessibilidade: todas as mesas devem ter caminho até a saída
         acessivel, mesas_isoladas = _verificar_acessibilidade_mesas(ws, env_cells, room_cells, target_bench_cells)
+        resultado["mesas_sem_saida"] = mesas_isoladas
+        
         if not acessivel and mesas_isoladas:
+            room_cells_antes = set(room_cells)
             room_cells = _expandir_corredor_para_acessibilidade(
                 ws, env_cells, room_cells, target_bench_cells, mesas_isoladas
             )
+            resultado["relocated_cells"] = room_cells - room_cells_antes
 
         # CORREÇÃO 3: Unifica o contorno geométrico das salas apenas no final para evitar 'dentes na parede'
         if room_cells_override is not None:
             room_cells = room_cells | room_cells_override
 
     corridor_cells = room_cells - target_bench_cells
+    resultado["room_cells"] = room_cells
+    resultado["corridor_cells"] = corridor_cells
+    
     cell_ct_coord = None
     if corridor_cells and not reconstruir_sala:
         max_r = max(r for r, c in room_cells)
@@ -937,6 +995,8 @@ def separar_ambiente_e_desenhar_divisorias(
             cell_ct.value = "CT"
             cell_ct.fill = fill_ct
             cell_ct.font = Font(color="FFFFFF", bold=True, size=8)
+    
+    resultado["ct_cell"] = cell_ct_coord
 
     if reconstruir_sala:
         for r, c in room_cells:
@@ -957,6 +1017,24 @@ def separar_ambiente_e_desenhar_divisorias(
             _aplicar_borda_espelhada(ws, r, c, 'left', side_style)
         if (r, c + 1) not in room_cells:
             _aplicar_borda_espelhada(ws, r, c, 'right', side_style)
+
+    # Validação final
+    if not reconstruir_sala:
+        acessivel_final, mesas_isoladas_final = _verificar_acessibilidade_mesas(
+            ws, env_cells, room_cells, target_bench_cells
+        )
+        resultado["mesas_sem_saida"] = mesas_isoladas_final
+        
+        if mesas_isoladas_final:
+            resultado["motivo"] = f"{len(mesas_isoladas_final)} mesas sem acesso à saída"
+        elif cell_ct_coord is None:
+            resultado["motivo"] = "não foi possível posicionar CT"
+        else:
+            resultado["valido"] = True
+    else:
+        resultado["valido"] = True
+    
+    return resultado
 
 def _copiar_lado(side_obj):
     if not side_obj or not side_obj.style or side_obj.style == 'none':
@@ -995,7 +1073,14 @@ def _aplicar_borda_espelhada(ws, r, c, side, side_style):
 # Função de Seleção e Execução de Teste Manual
 # ══════════════════════════════════════════════════════════════════════════
 
-def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty: int) -> Set[Tuple[int, int]]:
+def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty: int, cliente_atual: str = None) -> Set[Tuple[int, int]]:
+    """
+    Seleciona mesas contíguas para formar um ambiente.
+    
+    O AmbienteBuilder é AGNÓSTICO quanto ao conteúdo das células.
+    Ele seleciona qualquer célula que seja fisicamente uma mesa,
+    independente de qual cliente está nela atualmente.
+    """
     all_desks = set()
     for r, c in env_cells:
         cell = ws.cell(row=r, column=c)
@@ -1323,8 +1408,235 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
 
     if len(selected_list) > target_qty:
         selected_list = selected_list[:target_qty]
+    
+    # RETANGULARIZAÇÃO: Tenta completar linhas/colunas parciais para evitar "dentes"
+    selected_set = set(selected_list)
+    if selected_set:
+        # Identifica bancadas que têm células selecionadas
+        from BlockMapper import flood_fill
+        selected_benches = flood_fill(selected_set)
+        
+        for bench in selected_benches:
+            bench_set = set(bench)
+            # Pega todas as células dessa bancada que estão em all_desks
+            full_bench = bench_set & all_desks
+            
+            # Se a bancada tem 2 colunas (bancada dupla vertical)
+            bench_cols = {c for r, c in full_bench}
+            bench_rows = {r for r, c in full_bench}
+            
+            if len(bench_cols) == 2:
+                # Verifica se há linhas "incompletas" (só 1 célula de 2)
+                for row in bench_rows:
+                    cells_in_row = [(r, c) for r, c in full_bench if r == row]
+                    selected_in_row = [(r, c) for r, c in cells_in_row if (r, c) in selected_set]
+                    
+                    # Se tem 1 selecionada mas a bancada tem 2 nessa linha
+                    if len(selected_in_row) == 1 and len(cells_in_row) == 2:
+                        # Adiciona a célula faltante para completar a linha
+                        missing = [c for c in cells_in_row if c not in selected_set]
+                        if missing:
+                            selected_set.add(missing[0])
+            
+            elif len(bench_rows) == 2:
+                # Bancada dupla horizontal - completa colunas
+                for col in bench_cols:
+                    cells_in_col = [(r, c) for r, c in full_bench if c == col]
+                    selected_in_col = [(r, c) for r, c in cells_in_col if (r, c) in selected_set]
+                    
+                    if len(selected_in_col) == 1 and len(cells_in_col) == 2:
+                        missing = [c for c in cells_in_col if c not in selected_set]
+                        if missing:
+                            selected_set.add(missing[0])
+        
+        selected_list = list(selected_set)
                 
     return set(selected_list)
+
+
+def gerar_alternativas_mesas(
+    env_cells: Set[Tuple[int, int]], 
+    ws, 
+    target_qty: int, 
+    max_alternativas: int = 5
+) -> List[Set[Tuple[int, int]]]:
+    """
+    Gera múltiplas alternativas de seleção de mesas, priorizando regiões compactas e retangulares.
+    
+    REGRA CRÍTICA: Só seleciona mesas de bancadas que são FISICAMENTE CONTÍGUAS (adjacentes),
+    sem células de outros clientes entre elas.
+    """
+    from BlockMapper import flood_fill
+    
+    # Coleta todas as mesas válidas (excluindo células de outros clientes)
+    all_desks = set()
+    for r, c in env_cells:
+        cell = ws.cell(row=r, column=c)
+        val = str(cell.value).strip().upper() if cell.value else ""
+        if val.startswith("N_"):
+            continue
+        if _eh_celula_de_mesa_local(cell):
+            all_desks.add((r, c))
+    
+    if not all_desks:
+        return []
+    
+    # Agrupa mesas em bancadas contíguas
+    benches = flood_fill(all_desks)
+    if not benches:
+        return []
+    
+    alternativas = []
+    
+    # Ordena bancadas por tamanho (maior primeiro)
+    benches_sorted = sorted(benches, key=lambda b: len(b), reverse=True)
+    
+    # ESTRATÉGIA 1: Tenta usar UMA ÚNICA bancada grande
+    for bench in benches_sorted:
+        bench_set = set(bench)
+        if len(bench_set) >= target_qty:
+            # Gera alternativa pegando do topo da bancada
+            b_rows = sorted(list({r for r, c in bench_set}))
+            b_cols = sorted(list({c for r, c in bench_set}))
+            is_vertical = len(b_rows) >= len(b_cols)
+            
+            selected = set()
+            if is_vertical:
+                # Pega linhas do topo para baixo
+                for row in b_rows:
+                    cells_in_row = sorted([(r, c) for r, c in bench_set if r == row], key=lambda x: x[1])
+                    for cell in cells_in_row:
+                        if len(selected) >= target_qty:
+                            break
+                        selected.add(cell)
+                    if len(selected) >= target_qty:
+                        break
+            else:
+                # Pega colunas da esquerda para direita
+                for col in b_cols:
+                    cells_in_col = sorted([(r, c) for r, c in bench_set if c == col], key=lambda x: x[0])
+                    for cell in cells_in_col:
+                        if len(selected) >= target_qty:
+                            break
+                        selected.add(cell)
+                    if len(selected) >= target_qty:
+                        break
+            
+            if len(selected) >= target_qty:
+                rs = [r for r, c in selected]
+                cs = [c for r, c in selected]
+                bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1)
+                alternativas.append((bbox_area, len(selected), selected))
+    
+    # ESTRATÉGIA 2: Combina APENAS bancadas adjacentes (distância 1, sem obstáculos entre elas)
+    if not alternativas or all(len(alt[2]) < target_qty for alt in alternativas):
+        n_benches = len(benches)
+        
+        # Para cada bancada, encontra bancadas DIRETAMENTE adjacentes
+        adjacency = {i: set() for i in range(n_benches)}
+        
+        for i in range(n_benches):
+            for j in range(i + 1, n_benches):
+                # Verifica se há célula de bench_i adjacente a célula de bench_j
+                adjacent = False
+                for r1, c1 in benches[i]:
+                    if adjacent:
+                        break
+                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                        nr, nc = r1 + dr, c1 + dc
+                        if (nr, nc) in set(benches[j]):
+                            adjacent = True
+                            break
+                        # Também aceita se há apenas 1 célula de corredor livre entre elas
+                        if (nr, nc) in env_cells and (nr, nc) not in all_desks:
+                            cell_between = ws.cell(row=nr, column=nc)
+                            val_between = str(cell_between.value).strip().upper() if cell_between.value else ""
+                            # Célula entre deve ser corredor vazio, não outro cliente
+                            if not val_between.startswith("N_") and not _eh_celula_de_mesa_local(cell_between):
+                                for dr2, dc2 in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                                    if (nr + dr2, nc + dc2) in set(benches[j]):
+                                        adjacent = True
+                                        break
+                        if adjacent:
+                            break
+                
+                if adjacent:
+                    adjacency[i].add(j)
+                    adjacency[j].add(i)
+        
+        # BFS para encontrar grupos de bancadas conectadas
+        visited = set()
+        grupos_conectados = []
+        
+        for start in range(n_benches):
+            if start in visited:
+                continue
+            grupo = []
+            fila = [start]
+            while fila:
+                curr = fila.pop(0)
+                if curr in visited:
+                    continue
+                visited.add(curr)
+                grupo.append(curr)
+                for adj in adjacency[curr]:
+                    if adj not in visited:
+                        fila.append(adj)
+            if grupo:
+                grupos_conectados.append(grupo)
+        
+        # Para cada grupo conectado, gera alternativa
+        for grupo in grupos_conectados:
+            grupo_benches = [benches[i] for i in grupo]
+            total_cap = sum(len(b) for b in grupo_benches)
+            
+            if total_cap < target_qty:
+                continue
+            
+            # Ordena bancadas do grupo por posição (top-left first)
+            grupo_benches_sorted = sorted(grupo_benches, key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
+            
+            selected = set()
+            for bench in grupo_benches_sorted:
+                bench_list = sorted(list(bench), key=lambda x: (x[0], x[1]))
+                for cell in bench_list:
+                    if len(selected) >= target_qty:
+                        break
+                    selected.add(cell)
+                if len(selected) >= target_qty:
+                    break
+            
+            if len(selected) >= target_qty:
+                rs = [r for r, c in selected]
+                cs = [c for r, c in selected]
+                bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1)
+                alternativas.append((bbox_area, len(selected), selected))
+    
+    # Fallback: usa a seleção original
+    if not alternativas:
+        original = _selecionar_mesas_contiguas(env_cells, ws, target_qty)
+        if original:
+            rs = [r for r, c in original]
+            cs = [c for r, c in original]
+            bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1) if original else float('inf')
+            alternativas.append((bbox_area, len(original), original))
+    
+    # Ordena por compacidade (menor bbox_area primeiro)
+    alternativas.sort(key=lambda x: (x[0], -x[1]))
+    
+    # Remove duplicatas
+    seen = set()
+    resultado = []
+    for _, _, selected in alternativas:
+        key = frozenset(selected)
+        if key not in seen:
+            seen.add(key)
+            resultado.append(selected)
+            if len(resultado) >= max_alternativas:
+                break
+    
+    return resultado
+
 
 def testar_criacao_sala_manual(
     file_path: str,
