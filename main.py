@@ -27,7 +27,9 @@ from AmbienteBuilder import (
     separar_ambiente_e_desenhar_divisorias,
     _selecionar_mesas_contiguas,
     _gerar_layout_sala_estruturado,
-    _celulas_contorno_do_ambiente
+    _celulas_contorno_do_ambiente,
+    _eh_celula_de_mesa_local,
+    _tem_parede_laranja_entre,
 )
 
 # Importando dependências e agentes do Agents.py (Fluxo de 2 Agentes)
@@ -234,6 +236,28 @@ async def main():
                         origem_cells = set(env_match.get('cells', []))
             return origem_cells, ambiente_resolvido
 
+        def _componentes_sem_cruzar_paredes(ws_ref, cells):
+            restantes = set(cells)
+            componentes = []
+            while restantes:
+                inicio = min(restantes)
+                pilha = [inicio]
+                componente = {inicio}
+                restantes.remove(inicio)
+                while pilha:
+                    r, c = pilha.pop()
+                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        vizinha = (r + dr, c + dc)
+                        if vizinha not in restantes:
+                            continue
+                        if _tem_parede_laranja_entre(ws_ref, r, c, vizinha[0], vizinha[1]):
+                            continue
+                        restantes.remove(vizinha)
+                        componente.add(vizinha)
+                        pilha.append(vizinha)
+                componentes.append(componente)
+            return componentes
+
         def _estilo_cliente(cliente_dest):
             fill_to_apply = None
             font_to_apply = None
@@ -311,6 +335,31 @@ async def main():
                 cliente_dest = amb.get("cliente_destinado")
                 sala_lugares = amb.get("sala_lugares", 0)
                 env_cells_base = set(origem_cells) - ambientes_ocupados_cells - reservado_grupo
+
+                if reservado_grupo and env_cells_base:
+                    componentes = _componentes_sem_cruzar_paredes(ws_planejamento, env_cells_base)
+                    componentes_viaveis = []
+                    for componente in componentes:
+                        mesas_componente = sum(
+                            1
+                            for r, c in componente
+                            if _eh_celula_de_mesa_local(ws_planejamento.cell(row=r, column=c))
+                        )
+                        if mesas_componente >= qtd_mesas:
+                            componentes_viaveis.append((componente, mesas_componente))
+
+                    if componentes_viaveis:
+                        componentes_viaveis.sort(
+                            key=lambda item: (
+                                item[1],
+                                min(c for r, c in item[0]),
+                                min(r for r, c in item[0]),
+                            )
+                        )
+                        env_cells_base = set(componentes_viaveis[0][0])
+                    else:
+                        env_cells_base = set()
+
                 env_cells = env_cells_base | _celulas_contorno_do_ambiente(ws_planejamento, env_cells_base)
 
                 if not env_cells_base:
