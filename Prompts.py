@@ -7,6 +7,9 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 1. REMOVER (Liberar): Se solicitado, emita ações de 'liberar' para remover os clientes existentes/estáveis que precisam ser reduzidos.
 2. POSICIONAR: Se solicitado, posicione os novos clientes nos espaços identificados como 'vazio'. Esse posicionamento pode ser feito de qualquer jeito (utilize sempre 'automatico' para bloco e ambiente).
 3. CRIAR AMBIENTES: Se solicitado, mande criar os novos ambientes fechados especificando o bloco e ambiente físico exato onde a parede/divisória deve ser construída.
+   Para criacao de ambiente fechado, NAO exija que o local escolhido esteja vazio. O motor fisico pode recortar mesas ocupadas; depois o organizador fara a reorganizacao pesada.
+   A viabilidade aritmetica dos novos ambientes deve considerar apenas se a planta, apos as liberacoes solicitadas, possui quantidade total suficiente de PAs "vazio" para absorver os deslocamentos/criacoes.
+   Nunca afirme que paredes/divisorias criam novas PAs. Paredes apenas separam PAs fisicas existentes.
 
 == PLANTA ==
 {plant_info}
@@ -22,6 +25,7 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 2. NOVOS CLIENTES: Use apenas os nomes informados nas diretrizes de nomenclatura (ex: 'N_1', 'N_2').
 3. POSICIONAMENTO SIMPLIFICADO: Em todas as ações de `"acoes_primarias"` (seja 'liberar' ou 'realocar'), defina sempre `"bloco": "automatico"` e `"ambiente": "automatico"`. O motor físico fará a distribuição automática nas vagas.
 4. CRIAÇÃO DE AMBIENTES E SALAS: Se as premissas exigirem novos ambientes fechados (closed rooms) e/ou salas de reunião internas (salas de X lugares dentro deles), defina-os estritamente no nó 'criar_ambientes'. No caso de haver sala de reunião interna requerida dentro do espaço, você DEVE adicionar o campo 'sala_lugares': X no objeto desse ambiente. Se não for exigida nenhuma sala interna para aquele ambiente, omita ou defina 'sala_lugares': 0.
+5. CAPACIDADE PARA CRIAR AMBIENTES: Para decidir se uma criacao e viavel, faca a conta global de PAs liberadas/vazias contra a demanda total dos novos clientes. Nao descarte um bloco/ambiente de criacao so porque hoje ele esta ocupado por outro cliente.
 
 == CONTROLE DE INVENTÁRIO (SOMA ZERO CRÍTICA) ==
 - A quantidade total de PAs liberadas de um cliente antigo deve ser igual à redução solicitada.
@@ -92,6 +96,7 @@ Sua missão única é organizar o layout de acordo com as premissas utilizando e
 == REGRA CRÍTICA SOBRE NOVOS AMBIENTES ==
 ATENÇÃO: O motor físico (AmbienteBuilder) JÁ posicionou os novos clientes DENTRO das divisórias criadas.
 Após a criação das divisórias, o scanner RE-ESCANEIA o bloco e as LETRAS DOS AMBIENTES PODEM MUDAR.
+Se a lista de ambientes criados informar FALHA para algum novo cliente exigido nas premissas, isso e violacao obrigatoria. Nao declare a proposta correta enquanto esse cliente nao existir com a quantidade solicitada.
 
 Exemplo: O posicionador solicitou "criar N_1 no Bloco_7-B", mas após criar as divisórias:
 - O scanner pode detectar o novo ambiente como Bloco_7-A, Bloco_7-C, ou qualquer outra letra

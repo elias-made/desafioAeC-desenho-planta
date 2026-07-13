@@ -1712,7 +1712,7 @@ if __name__ == "__main__":
         sheet_name="JPIII",
         bloco_id="Bloco_7",
         ambiente_letra="A",         
-        quantidade_mesas=124, 
-        quantidade_mesas_sala=4,
+        quantidade_mesas=165, 
+        quantidade_mesas_sala=1,
         output_path="planta_teste_sala.xlsx"
     )
