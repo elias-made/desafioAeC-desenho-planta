@@ -1073,7 +1073,7 @@ def _aplicar_borda_espelhada(ws, r, c, side, side_style):
 # Função de Seleção e Execução de Teste Manual
 # ══════════════════════════════════════════════════════════════════════════
 
-def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty: int, cliente_atual: str = None) -> Set[Tuple[int, int]]:
+def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty: int, cliente_atual: str = None, priorizar_sobras: bool = False) -> Set[Tuple[int, int]]:
     """
     Seleciona mesas contíguas para formar um ambiente.
     
@@ -1180,7 +1180,28 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
     max_bench_cap = max(len(b) for b in selected_benches) if selected_benches else 0
     
     if adjusted_target_qty > max_bench_cap:
-        selected_benches_sorted = sorted(selected_benches, key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
+        if priorizar_sobras:
+            vertical_count = sum(
+                1 for b in selected_benches
+                if len({r for r, c in b}) >= len({c for r, c in b})
+            )
+            if vertical_count >= len(selected_benches) - vertical_count:
+                # Em bancadas verticais, preserva a continuidade lateral mesmo
+                # quando o topo da primeira bancada ja pertence a outra sala.
+                selected_benches_sorted = sorted(
+                    selected_benches,
+                    key=lambda b: (min(c for r, c in b), min(r for r, c in b)),
+                )
+            else:
+                selected_benches_sorted = sorted(
+                    selected_benches,
+                    key=lambda b: (min(r for r, c in b), min(c for r, c in b)),
+                )
+        else:
+            selected_benches_sorted = sorted(
+                selected_benches,
+                key=lambda b: (min(r for r, c in b), min(c for r, c in b)),
+            )
         
         remaining_qty = adjusted_target_qty
         for b in selected_benches_sorted:

@@ -216,11 +216,6 @@ async def main():
     if criar_ambientes_solicitados:
         print("[AMBIENTE BUILDER] Planejando criacoes fisicas em lote por origem.")
 
-        def _origem_key(amb):
-            bloco = amb.get("bloco")
-            letra = amb.get("ambiente")
-            return (str(bloco), str(letra).upper() if letra else "")
-
         def _resolver_origem_cells(bloco_id, ambiente_letra, macro_blocks):
             origem_cells = set()
             ambiente_resolvido = ambiente_letra
@@ -269,7 +264,26 @@ async def main():
 
         grupos_por_origem = {}
         for amb in criar_ambientes_solicitados:
-            grupos_por_origem.setdefault(_origem_key(amb), []).append(amb)
+            bloco_solicitado = amb.get("bloco")
+            letra_solicitada = amb.get("ambiente")
+            origem_resolvida, _ = _resolver_origem_cells(
+                bloco_solicitado,
+                letra_solicitada,
+                macro_blocks_atual,
+            )
+
+            # Letras de ambientes mudam depois que novas divisorias sao criadas.
+            # A identidade estavel da origem e o conjunto de celulas fisicas do
+            # escaneamento anterior as obras, nao a letra sugerida pelo agente.
+            if origem_resolvida:
+                origem_key = (str(bloco_solicitado), frozenset(origem_resolvida))
+            else:
+                origem_key = (
+                    str(bloco_solicitado),
+                    "origem_nao_localizada",
+                    str(letra_solicitada).upper() if letra_solicitada else "",
+                )
+            grupos_por_origem.setdefault(origem_key, []).append(amb)
 
         for origem_key, grupo in grupos_por_origem.items():
             bloco_id = grupo[0].get("bloco")
@@ -316,7 +330,12 @@ async def main():
 
                 room_cells_set = set(room_cells_override) if room_cells_override else set()
                 available_env_cells = env_cells - room_cells_set
-                allocated_ambiente = _selecionar_mesas_contiguas(available_env_cells, ws_planejamento, qtd_mesas)
+                allocated_ambiente = _selecionar_mesas_contiguas(
+                    available_env_cells,
+                    ws_planejamento,
+                    qtd_mesas,
+                    priorizar_sobras=bool(reservado_grupo),
+                )
 
                 if allocated_ambiente and len(allocated_ambiente) < qtd_mesas:
                     msg = (
@@ -359,7 +378,11 @@ async def main():
                     )
                     ambiente_room_cells |= (resultado_sala_planejada.get("room_cells", set()) or room_cells_set)
 
-                reservado_grupo.update(ambiente_room_cells)
+                # O proximo ambiente pode reutilizar mesas que ficaram fora da
+                # alocacao efetiva, mesmo que estejam proximas ao contorno do
+                # ambiente anterior. Reservar todo `room_cells` fazia bancadas
+                # parcialmente usadas desaparecerem da selecao seguinte.
+                reservado_grupo.update(allocated_total)
                 reservas.append({
                     "amb": amb,
                     "ambiente_letra": ambiente_resolvido,
