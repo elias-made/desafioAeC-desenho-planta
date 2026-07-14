@@ -1,67 +1,48 @@
 # main.py
 
 import asyncio
+import json
 import os
 import shutil
 import openpyxl
 import traceback
 import re
 from copy import copy
-from typing import List, Tuple
 from dotenv import load_dotenv
 from openpyxl.styles import PatternFill, Font
+from openpyxl.cell.cell import MergedCell
 
-# Importando dependências do LayoutEngine
+# Importando dependencias do LayoutEngine
 from LayoutEngine import (
     SHEET_NAME, FORBIDDEN_PATTERNS,
     Acao, PropostaMock, clean_json_string, extrair_e_carregar_json,
     load_plant, clone_ws, build_plant_info, build_blocos_info,
     execute_alocacao, write_report, salvar_auditoria,
-    normalizar_acoes, validar_inventario, FILL_LIBERADO, FONT_SMALL,
-    FILL_NEW_CLIENT, FONT_WHITE
+    normalizar_acoes, validar_inventario
 )
 
 # Importando dependências do AmbienteBuilder
-from AmbienteBuilder import separar_ambiente_e_desenhar_divisorias, _selecionar_mesas_contiguas, _gerar_layout_sala_estruturado, gerar_alternativas_mesas
+from AmbienteBuilder import (
+    separar_ambiente_e_desenhar_divisorias,
+    _selecionar_mesas_contiguas,
+    _gerar_layout_sala_estruturado,
+    _celulas_contorno_do_ambiente,
+    _eh_celula_de_mesa_local,
+    _tem_parede_laranja_entre,
+)
 
 # Importando dependências e agentes do Agents.py (Fluxo de 2 Agentes)
 from Agents import PosicionadorDeps, OrganizadorDeps, posicionador, organizador
 from ScannerPremissas import scan_orange_context, normalize_val
 from BlockMapper import scan_plant
+from CapacityValidator import avaliar_capacidade
+from InventoryReconciler import reconciliar_inventario
+from PremiseNormalizer import (
+    normalizar_nomes_novos_por_ordem,
+    normalizar_quantidades_ambientes,
+)
 
 load_dotenv()
-
-# ══════════════════════════════════════════════════════════════════════════
-# Sobrescrita Local de get_env_cells para Criação de Salas Consecutivas
-# ══════════════════════════════════════════════════════════════════════════
-
-def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) -> List[Tuple[int, int]]:
-    """Identifica as coordenadas das células de TODOS os ambientes do bloco.
-    
-    Para criação consecutiva de novos ambientes no mesmo bloco, precisamos do espaço
-    total disponível — não apenas o maior fragmento. A subtração das células já consumidas
-    (feita pelo acumulador no loop principal) garante que não haja sobreposição.
-    """
-    if not block_id_str or not env_letter:
-        return []
-    block_match = re.search(r'\d+', str(block_id_str))
-    if not block_match:
-        return []
-    block_idx = int(block_match.group())
-    if block_idx <= len(macro_blocks):
-        block = macro_blocks[block_idx - 1]
-        block_envs = {e['id'].upper(): e for e in block.get('ambientes', [])}
-        
-        if not block_envs:
-            return []
-            
-        # Retorna TODAS as células de todos os ambientes do bloco
-        # O acumulador de consumidas no loop principal garante a não-sobreposição
-        cells = []
-        for env in block_envs.values():
-            cells.extend(env['cells'])
-        return cells
-    return []
 
 # ══════════════════════════════════════════════════════════════════════════
 # Fluxo de Execução Principal (Unificado de 2 Etapas com Auto-Correção)
@@ -134,9 +115,6 @@ async def main():
     dest_file = "propostas/proposta_final.xlsx"
     safe_name = "final"
     os.makedirs('propostas', exist_ok=True)
-    shutil.copy("planta.xlsx", dest_file)
-    new_wb = openpyxl.load_workbook(dest_file)
-    new_ws = new_wb[SHEET_NAME]
 
     pos_deps = PosicionadorDeps(
         plant_info=plant_info_str,
@@ -151,10 +129,18 @@ async def main():
     )
     rascunho_layout_json = clean_json_string(res_posicionador.output)
     pos_data = extrair_e_carregar_json(rascunho_layout_json)
+    pos_data = normalizar_nomes_novos_por_ordem(pos_data, premissas_txt)
+    rascunho_layout_json = json.dumps(pos_data, ensure_ascii=False, indent=2)
     
     # Executa a alocação bruta na planilha master
     acoes_totais = []
     for ac in pos_data.get("acoes_primarias", []):
+        tipo = str(ac.get("tipo", "")).strip().lower()
+        if tipo not in ("liberar", "realocar", "posicionar"):
+            raise ValueError(
+                f"Acao invalida do posicionador: '{tipo}'. "
+                "O posicionador so pode liberar ou realocar/posicionar."
+            )
         acoes_totais.append(Acao(**ac))
         
     gabarito_dados = pos_data.get("gabarito", {})
@@ -179,395 +165,460 @@ async def main():
         
     novos_clientes_brutos = gabarito_dados.get("novos_clientes", [])
     novos_clientes_extraidos = []
+    pas_operacionais_explicitos = {}
     for nc in novos_clientes_brutos:
         if isinstance(nc, dict):
             nome_orig = nc.get("nome", "")
-            pas = nc.get("PAs", 0)
+            pas_explicitos = nc.get("PAs_operacionais")
+            pas = pas_explicitos if pas_explicitos is not None else nc.get("PAs", 0)
         else:
             nome_orig = str(nc)
+            pas_explicitos = None
             pas = 0
         nome_norm = nome_orig.upper().strip().replace(" ", "_")
+        pas_operacionais = int(pas or 0)
         novos_clientes_extraidos.append({
             "nome": nome_norm,
-            "PAs": pas
+            "PAs": pas_operacionais
         })
+        if pas_explicitos is not None:
+            pas_operacionais_explicitos[nome_norm] = pas_operacionais
         
     parametros_premissas = {
-        "reducoes": {normalize_val(k): v for k, v in gabarito_dados.get("reducoes", {}).items()},
+        "reducoes": {normalize_val(k): int(v or 0) for k, v in gabarito_dados.get("reducoes", {}).items()},
         "novos_clientes": novos_clientes_extraidos
     }
         
     # Normaliza as ações primárias antes de executar
     acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
         
+    criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
+    normalizar_quantidades_ambientes(
+        criar_ambientes_solicitados,
+        parametros_premissas["novos_clientes"],
+        pas_operacionais_explicitos,
+    )
+    capacidade = avaliar_capacidade(
+        ws,
+        allowed_cells,
+        parametros_premissas["reducoes"],
+        parametros_premissas["novos_clientes"],
+        criar_ambientes_solicitados,
+        plant_data["client_cells"],
+    )
+    if not capacidade.viavel:
+        aviso = capacidade.aviso()
+        caminho_aviso = "propostas/aviso_inviabilidade.txt"
+        with open(caminho_aviso, "w", encoding="utf-8") as f:
+            f.write(aviso)
+        salvar_auditoria(
+            "1_posicionador_inviavel",
+            f"[PREMISSAS]\n{premissas_completas}\n\n[PLANO]\n{rascunho_layout_json}",
+            aviso, safe_name,
+        )
+        print(f"\n⚠ {aviso}\n\nAviso gravado em '{caminho_aviso}'.")
+        return
+
+    caminho_aviso = "propostas/aviso_inviabilidade.txt"
+    if os.path.exists(caminho_aviso):
+        os.remove(caminho_aviso)
+
+    # A copia de trabalho so nasce depois da aprovacao aritmetica.
+    shutil.copy("planta.xlsx", dest_file)
+    new_wb = openpyxl.load_workbook(dest_file)
+    new_ws = new_wb[SHEET_NAME]
+    clientes_criados_por_parede = {
+        normalize_val(amb.get("cliente_destinado"))
+        for amb in criar_ambientes_solicitados
+        if amb.get("cliente_destinado")
+    }
+    acoes_pre_ambiente_builder = [
+        acao for acao in acoes_totais
+        if not (
+            acao.tipo.lower().strip() in ("realocar", "posicionar")
+            and normalize_val(acao.cliente) in clientes_criados_por_parede
+        )
+    ]
     proposta_inicial = PropostaMock(
         nome=pos_data.get("nome", "Alocacao Bruta"),
         custo_obras="Baixo",
-        acoes=acoes_totais
+        acoes=acoes_pre_ambiente_builder
     )
     
-    # Executa o rascunho de posicionamento bruto de soma-zero na planilha master
+    # Executa primeiro apenas o que precisa existir antes das obras fisicas.
+    # Os novos clientes com ambiente fechado sao posicionados pelo AmbienteBuilder.
     log_acumulado, _ = execute_alocacao(new_ws, proposta_inicial, plant_data, allowed_cells, file_path='planta.xlsx')
-    criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
-
+    
+    # SALVA A PLANILHA APÓS execute_alocacao - CRÍTICO!
+    # Isso garante que dest_file reflita as modificações em memória
+    new_wb.save(dest_file)
+    
     # === INTEGRAÇÃO DO AMBIENTEBUILDER ===
     ambientes_criados_info = []
+    salas_internas_cells = set()
+    ambientes_fisicos_falhos = set()
+    ambientes_ocupados_cells = set()
+    origem_disponivel_por_chave = {}
     if criar_ambientes_solicitados:
-        print("🛠️ Iniciando AmbienteBuilder para desenhar divisórias físicas...")
-        
-        # CORREÇÃO: Acumulador de células já consumidas por ambientes anteriores no mesmo bloco
-        # Evita sobreposição e restauração destrutiva entre iterações consecutivas
-        celulas_ja_consumidas: set = set()
-        # Mapeia bloco -> conjunto de células já alocadas (para exclusão precisa por bloco)
-        celulas_consumidas_por_bloco: dict = {}
-        
+        print("[AMBIENTE BUILDER] Planejando criacoes fisicas em lote por origem.")
+
+        def _resolver_origem_cells(bloco_id, ambiente_letra, macro_blocks):
+            origem_cells = set()
+            ambiente_resolvido = ambiente_letra
+            block_match = re.search(r'\d+', str(bloco_id))
+            if block_match:
+                block_idx = int(block_match.group())
+                if block_idx <= len(macro_blocks):
+                    block = macro_blocks[block_idx - 1]
+                    envs = block.get('ambientes', [])
+                    target_letter = str(ambiente_letra).upper() if ambiente_letra else ""
+                    env_match = next((env for env in envs if env.get('id', '').upper() == target_letter), None)
+                    if env_match is None and envs:
+                        env_match = max(envs, key=lambda env: len(env.get('cells', [])))
+                    if env_match is not None:
+                        ambiente_resolvido = env_match.get('id', ambiente_letra)
+                        origem_cells = set(env_match.get('cells', []))
+            return origem_cells, ambiente_resolvido
+
+        def _componentes_sem_cruzar_paredes(ws_ref, cells):
+            restantes = set(cells)
+            componentes = []
+            while restantes:
+                inicio = min(restantes)
+                pilha = [inicio]
+                componente = {inicio}
+                restantes.remove(inicio)
+                while pilha:
+                    r, c = pilha.pop()
+                    for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        vizinha = (r + dr, c + dc)
+                        if vizinha not in restantes:
+                            continue
+                        if _tem_parede_laranja_entre(ws_ref, r, c, vizinha[0], vizinha[1]):
+                            continue
+                        restantes.remove(vizinha)
+                        componente.add(vizinha)
+                        pilha.append(vizinha)
+                componentes.append(componente)
+            return componentes
+
+        def _estilo_cliente(cliente_dest):
+            fill_to_apply = None
+            font_to_apply = None
+            for r_search in range(1, new_ws.max_row + 1):
+                for c_search in range(1, new_ws.max_column + 1):
+                    cell_search = new_ws.cell(row=r_search, column=c_search)
+                    if cell_search.value is not None and normalize_val(cell_search.value) == normalize_val(cliente_dest):
+                        fill_to_apply = copy(cell_search.fill) if cell_search.has_style else None
+                        font_to_apply = copy(cell_search.font) if cell_search.has_style else None
+                        break
+                if fill_to_apply:
+                    break
+            if not fill_to_apply:
+                paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
+                idx = 0
+                for i, nc in enumerate(parametros_premissas["novos_clientes"]):
+                    if nc["nome"] == cliente_dest:
+                        idx = i
+                        break
+                cor_hex = paleta_cores[idx % len(paleta_cores)]
+                fill_to_apply = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
+                font_to_apply = Font(color='FFFFFF', bold=True, size=8)
+            return fill_to_apply, font_to_apply
+
+        import ScannerPremissas
+        ScannerPremissas._orange_context_cache = {}
+        macro_blocks_atual = scan_orange_context(dest_file, SHEET_NAME)
+
+        grupos_por_origem = {}
         for amb in criar_ambientes_solicitados:
-            # Limpa o cache e força o re-scan físico a cada nova sala criada
-            import ScannerPremissas
-            ScannerPremissas._orange_context_cache = {}
-            macro_blocks_atual = scan_orange_context(dest_file, SHEET_NAME)
-            
-            bloco_id = amb.get("bloco")
-            ambiente_letra = amb.get("ambiente")
-            qtd_mesas = amb.get("quantidade_mesas")
-            cliente_dest = amb.get("cliente_destinado")
-            sala_lugares = amb.get("sala_lugares", 0)
-            
-            env_cells_raw = set(get_env_cells(bloco_id, ambiente_letra, macro_blocks_atual))
-            
-            # CORREÇÃO: Remove as células já consumidas por ambientes anteriores no mesmo bloco
-            # para garantir que não haja sobreposição de seleção de mesas
-            consumidas_neste_bloco = celulas_consumidas_por_bloco.get(bloco_id, set())
-            env_cells = env_cells_raw - consumidas_neste_bloco
-            
-            if env_cells:
+            bloco_solicitado = amb.get("bloco")
+            letra_solicitada = amb.get("ambiente")
+            origem_resolvida, _ = _resolver_origem_cells(
+                bloco_solicitado,
+                letra_solicitada,
+                macro_blocks_atual,
+            )
+
+            # Letras de ambientes mudam depois que novas divisorias sao criadas.
+            # A identidade estavel da origem e o conjunto de celulas fisicas do
+            # escaneamento anterior as obras, nao a letra sugerida pelo agente.
+            if origem_resolvida:
+                origem_key = (str(bloco_solicitado), frozenset(origem_resolvida))
+            else:
+                origem_key = (
+                    str(bloco_solicitado),
+                    "origem_nao_localizada",
+                    str(letra_solicitada).upper() if letra_solicitada else "",
+                )
+            grupos_por_origem.setdefault(origem_key, []).append(amb)
+
+        for origem_key, grupo in grupos_por_origem.items():
+            bloco_id = grupo[0].get("bloco")
+            ambiente_letra = grupo[0].get("ambiente")
+            origem_cells, ambiente_resolvido = _resolver_origem_cells(bloco_id, ambiente_letra, macro_blocks_atual)
+            origem_disponivel_por_chave[origem_key] = set(origem_cells)
+
+            if not origem_cells:
+                for amb in grupo:
+                    cliente_dest = amb.get("cliente_destinado")
+                    print(f"   Nao foi possivel localizar origem fisica para {cliente_dest} em {bloco_id}.")
+                    ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                    ambientes_criados_info.append(
+                        f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': origem fisica nao localizada."
+                    )
+                continue
+
+            reservas = []
+            reservado_grupo = set()
+            ws_planejamento = new_wb.copy_worksheet(new_ws)
+            ws_planejamento.title = "__planejamento_ambientes__"
+
+            for amb in grupo:
+                qtd_mesas = amb.get("quantidade_mesas")
+                cliente_dest = amb.get("cliente_destinado")
+                sala_lugares = amb.get("sala_lugares", 0)
+                env_cells_base = set(origem_cells) - ambientes_ocupados_cells - reservado_grupo
+
+                if reservado_grupo and env_cells_base:
+                    componentes = _componentes_sem_cruzar_paredes(ws_planejamento, env_cells_base)
+                    componentes_viaveis = []
+                    for componente in componentes:
+                        mesas_componente = sum(
+                            1
+                            for r, c in componente
+                            if _eh_celula_de_mesa_local(ws_planejamento.cell(row=r, column=c))
+                        )
+                        if mesas_componente >= qtd_mesas:
+                            componentes_viaveis.append((componente, mesas_componente))
+
+                    if componentes_viaveis:
+                        componentes_viaveis.sort(
+                            key=lambda item: (
+                                item[1],
+                                min(c for r, c in item[0]),
+                                min(r for r, c in item[0]),
+                            )
+                        )
+                        env_cells_base = set(componentes_viaveis[0][0])
+                    else:
+                        env_cells_base = set()
+
+                env_cells = env_cells_base | _celulas_contorno_do_ambiente(ws_planejamento, env_cells_base)
+
+                if not env_cells_base:
+                    print(f"   Sem area restante para criar {cliente_dest} em {bloco_id}.")
+                    ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                    ambientes_criados_info.append(
+                        f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': sem area restante na origem."
+                    )
+                    continue
+
                 allocated_sala = set()
                 room_cells_override = None
-                
-                # Se for solicitada sala interna pelo Posicionador, realiza o planejamento estrutural dela
                 if sala_lugares and sala_lugares > 0:
-                    print(f"   🛠️ Planejando Sala Fechada de {sala_lugares} mesas...")
-                    allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(new_ws, env_cells, sala_lugares)
-                
-                # Seleciona as mesas do salão aberto com base no restante das células livres do bloco
-                available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
-                alternativas = gerar_alternativas_mesas(
-                    available_env_cells, new_ws, qtd_mesas
+                    ancora_ambiente = _selecionar_mesas_contiguas(
+                        env_cells, ws_planejamento, qtd_mesas,
+                        priorizar_sobras=bool(reservado_grupo),
+                    )
+                    allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(
+                        ws_planejamento, env_cells, sala_lugares,
+                        anchor_cells=ancora_ambiente,
+                    )
+                    if room_cells_override:
+                        salas_internas_cells.update(room_cells_override)
+
+                room_cells_set = set(room_cells_override) if room_cells_override else set()
+                available_env_cells = env_cells - room_cells_set
+                allocated_ambiente = _selecionar_mesas_contiguas(
+                    available_env_cells,
+                    ws_planejamento,
+                    qtd_mesas,
+                    priorizar_sobras=bool(reservado_grupo),
                 )
-                allocated_ambiente = alternativas[0] if alternativas else set()
-                
-                if allocated_ambiente:
-                    allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
-                    
-                    # 1. Desenha o contorno das divisórias do salão aberto
-                    # A nova lógica BFS do builder para automaticamente ao encontrar mesas de outros clientes
-                    ambiente_fisico = {"valido": False, "motivo": "sem alternativa válida"}
-                    for alternativa in alternativas:
-                        candidato_total = alternativa | (
-                            room_cells_override if room_cells_override else set()
+
+                if room_cells_set and allocated_ambiente:
+                    # A sala pode se ligar ao salao por um pequeno corredor livre.
+                    # Exigir contato direto rejeitava layouts validos, como o N_1,
+                    # que possuia exatamente uma coluna de circulacao entre ambos.
+                    fronteira = {(coord, 0) for coord in room_cells_set}
+                    visitadas = set(room_cells_set)
+                    sala_encostada = False
+                    while fronteira and not sala_encostada:
+                        (r_atual, c_atual), distancia = fronteira.pop()
+                        if distancia >= 3:
+                            continue
+                        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            vizinha = (r_atual + dr, c_atual + dc)
+                            if vizinha not in env_cells or vizinha in visitadas:
+                                continue
+                            if _tem_parede_laranja_entre(
+                                ws_planejamento, r_atual, c_atual, vizinha[0], vizinha[1]
+                            ):
+                                continue
+                            if vizinha in allocated_ambiente:
+                                sala_encostada = True
+                                break
+                            # Somente celulas sem mesa podem servir de corredor.
+                            if not _eh_celula_de_mesa_local(
+                                ws_planejamento.cell(row=vizinha[0], column=vizinha[1])
+                            ):
+                                visitadas.add(vizinha)
+                                fronteira.add((vizinha, distancia + 1))
+
+                    if not sala_encostada:
+                        print(f"   Sala interna de {cliente_dest} ficou desconectada do novo ambiente.")
+                        ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                        ambientes_criados_info.append(
+                            f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': "
+                            "a sala interna nao ficou conectada ao salao principal."
                         )
-                        tentativa = separar_ambiente_e_desenhar_divisorias(
-                            ws=new_ws,
-                            env_cells=env_cells,
-                            allocated_cells=candidato_total,
-                            reconstruir_sala=False,
-                            room_cells_override=room_cells_override,
-                        )
-                        if tentativa.get("valido"):
-                            allocated_ambiente = alternativa
-                            allocated_total = candidato_total
-                            ambiente_fisico = tentativa
-                            break
-                        ambiente_fisico = tentativa
-                    if not ambiente_fisico.get("valido"):
-                        print(f"   Ambiente físico inválido: {ambiente_fisico.get('motivo')}")
                         continue
-                    
-                    # 2. Desenha o contorno interno e as mesas da sala fechada estruturada
-                    if room_cells_override:
-                        separar_ambiente_e_desenhar_divisorias(
-                            ws=new_ws, 
-                            env_cells=env_cells, 
-                            allocated_cells=allocated_sala,
-                            reconstruir_sala=True,
-                            room_cells_override=room_cells_override
-                        )
-                    
-                    # --- SINCRONIZAÇÃO DE CORES E VALORES (BUSCA GLOBAL INTEGRADA) ---
-                    fill_to_apply = None
-                    font_to_apply = None
-                    
-                    # Procura na planilha inteira pelo estilo do cliente destino (copia cor gerada na primeira etapa)
-                    for r_search in range(1, new_ws.max_row + 1):
-                        for c_search in range(1, new_ws.max_column + 1):
-                            cell_search = new_ws.cell(row=r_search, column=c_search)
-                            if cell_search.value is not None and normalize_val(cell_search.value) == normalize_val(cliente_dest):
-                                fill_to_apply = copy(cell_search.fill) if cell_search.has_style else None
-                                font_to_apply = copy(cell_search.font) if cell_search.has_style else None
-                                break
-                        if fill_to_apply:
-                            break
-                            
-                    # Caso seja um cliente inédito ainda sem estilo, aplica a paleta padrão
-                    if not fill_to_apply:
-                        paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
-                        idx = 0
-                        for i, nc in enumerate(parametros_premissas["novos_clientes"]):
-                            if nc["nome"] == cliente_dest:
-                                idx = i
-                                break
-                        cor_hex = paleta_cores[idx % len(paleta_cores)]
-                        fill_to_apply = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
-                        font_to_apply = Font(color='FFFFFF', bold=True, size=8)
 
-                    # Preenche os assentos do salão aberto
-                    for r, c in allocated_ambiente:
-                        cell = new_ws.cell(row=r, column=c)
-                        if cell.value != "CT":
-                            cell.value = cliente_dest
-                            cell.fill = fill_to_apply
-                            cell.font = font_to_apply
-                    
-                    # Preenche mesas da sala de reunião com estilo visual "vazio" cinza (indicando assentos de reunião)
-                    if room_cells_override:
-                        fill_sala = PatternFill(start_color="BDC3C7", end_color="BDC3C7", fill_type="solid")
-                        font_sala = Font(name="Calibri", size=9)
-                        for r, c in allocated_sala:
-                            cell = new_ws.cell(row=r, column=c)
-                            if cell.value != "CT":
-                                cell.value = "vazio"
-                                cell.fill = fill_sala
-                                cell.font = font_sala
-
-                    # CORREÇÃO: Registra TODAS as células consumidas nesta iteração no acumulador
-                    # Registra apenas as mesas alocadas efetivamente — não o envelope inteiro
-                    all_allocated_cells = (
-                        allocated_ambiente
-                        | (allocated_sala if allocated_sala else set())
-                        | ambiente_fisico.get("relocated_cells", set())
+                if allocated_ambiente and len(allocated_ambiente) < qtd_mesas:
+                    msg = (
+                        f"   Capacidade insuficiente para {cliente_dest} em {bloco_id}: "
+                        f"solicitado {qtd_mesas}, alocavel {len(allocated_ambiente)}. Ambiente nao criado."
                     )
-                    celulas_ja_consumidas.update(all_allocated_cells)
-                    celulas_consumidas_por_bloco.setdefault(bloco_id, set()).update(
-                        ambiente_fisico["room_cells"]
-                        | ambiente_fisico.get("relocated_cells", set())
-                    )
-                    
-                    # Restaura as demais células do bloco que não foram consumidas para o snapshot original
-                    # CORREÇÃO: Protege células de ambientes criados em iterações ANTERIORES contra restauração
-                    for r, c in env_cells:
-                        if (r, c) not in all_allocated_cells and (r, c) not in celulas_ja_consumidas:
-                            cell = new_ws.cell(row=r, column=c)
-                            if cell.value != "CT":
-                                snap = original_snapshot.get((r, c))
-                                if snap:
-                                    cell.value = snap['value']
-                                    if snap['fill']: cell.fill = snap['fill']
-                                    if snap['font']: cell.font = snap['font']
-
+                    print(msg)
+                    ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
                     ambientes_criados_info.append(
-                        f"- Criado Novo Ambiente Fechado no Bloco '{bloco_id}', Ambiente '{ambiente_letra}' "
-                        f"com {len(allocated_ambiente)} PAs operacionais"
-                        + (f" + sala fechada de {len(allocated_sala)} lugares" if allocated_sala else "")
-                        + f" para o cliente '{cliente_dest}'."
+                        f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': "
+                        f"solicitado {qtd_mesas} PAs, mas apenas {len(allocated_ambiente)} cabiam na area restante."
                     )
-                    print(f"   ✓ Divisórias físicas desenhadas no bloco {bloco_id}-{ambiente_letra}!")
-                    
-                    # Salva imediatamente após desenhar cada sala para persistir no disco para a próxima iteração
-                    new_wb.save(dest_file)
-                else:
-                    print(f"   ⚠️ Nenhuma mesa contígua encontrada para criar sala no {bloco_id}-{ambiente_letra}.")
-            else:
-                print(f"   ⚠️ Bloco/Ambiente '{bloco_id}-{ambiente_letra}' não localizado para o AmbienteBuilder.")
+                    continue
+
+                if not allocated_ambiente:
+                    print(f"   Nenhuma mesa encontrada para criar {cliente_dest} em {bloco_id}.")
+                    ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                    ambientes_criados_info.append(
+                        f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': nenhuma mesa utilizavel encontrada."
+                    )
+                    continue
+
+                allocated_total = allocated_ambiente | room_cells_set
+                resultado_planejado = separar_ambiente_e_desenhar_divisorias(
+                    ws=ws_planejamento,
+                    env_cells=env_cells,
+                    allocated_cells=allocated_total,
+                    reconstruir_sala=False,
+                    room_cells_override=room_cells_set
+                )
+                ambiente_room_cells = resultado_planejado.get("room_cells", set()) or allocated_total
+
+                if room_cells_set:
+                    resultado_sala_planejada = separar_ambiente_e_desenhar_divisorias(
+                        ws=ws_planejamento,
+                        env_cells=env_cells,
+                        allocated_cells=allocated_sala,
+                        reconstruir_sala=True,
+                        room_cells_override=room_cells_set
+                    )
+                    ambiente_room_cells |= (resultado_sala_planejada.get("room_cells", set()) or room_cells_set)
+
+                # O proximo ambiente pode reutilizar mesas que ficaram fora da
+                # alocacao efetiva, mesmo que estejam proximas ao contorno do
+                # ambiente anterior. Reservar todo `room_cells` fazia bancadas
+                # parcialmente usadas desaparecerem da selecao seguinte.
+                reservado_grupo.update(allocated_total)
+                reservas.append({
+                    "amb": amb,
+                    "ambiente_letra": ambiente_resolvido,
+                    "env_cells": env_cells,
+                    "allocated_ambiente": allocated_ambiente,
+                    "allocated_sala": allocated_sala,
+                    "room_cells_set": room_cells_set,
+                    "reserved_cells": ambiente_room_cells,
+                })
+
+            if ws_planejamento in new_wb.worksheets:
+                new_wb.remove(ws_planejamento)
+
+            for reserva in reservas:
+                amb = reserva["amb"]
+                bloco_id = amb.get("bloco")
+                cliente_dest = amb.get("cliente_destinado")
+                allocated_ambiente = reserva["allocated_ambiente"]
+                allocated_sala = reserva["allocated_sala"]
+                room_cells_set = reserva["room_cells_set"]
+                env_cells = reserva["env_cells"]
+                allocated_total = allocated_ambiente | room_cells_set
+
+                resultado_ambiente = separar_ambiente_e_desenhar_divisorias(
+                    ws=new_ws,
+                    env_cells=env_cells,
+                    allocated_cells=allocated_total,
+                    reconstruir_sala=False,
+                    room_cells_override=room_cells_set
+                )
+                ambiente_room_cells = resultado_ambiente.get("room_cells", set()) or reserva["reserved_cells"]
+                ambientes_ocupados_cells.update(ambiente_room_cells)
+                origem_disponivel_por_chave[origem_key].difference_update(ambiente_room_cells)
+
+                if room_cells_set:
+                    resultado_sala = separar_ambiente_e_desenhar_divisorias(
+                        ws=new_ws,
+                        env_cells=env_cells,
+                        allocated_cells=allocated_sala,
+                        reconstruir_sala=True,
+                        room_cells_override=room_cells_set
+                    )
+                    sala_room_cells = resultado_sala.get("room_cells", set()) or room_cells_set
+                    ambientes_ocupados_cells.update(sala_room_cells)
+                    origem_disponivel_por_chave[origem_key].difference_update(sala_room_cells)
+
+                fill_to_apply, font_to_apply = _estilo_cliente(cliente_dest)
+                for r, c in allocated_ambiente | allocated_sala:
+                    cell = new_ws.cell(row=r, column=c)
+                    if not isinstance(cell, MergedCell) and cell.value != "CT":
+                        cell.value = cliente_dest
+                        cell.fill = fill_to_apply
+                        cell.font = font_to_apply
+
+                all_allocated_cells = allocated_ambiente | room_cells_set
+                for r, c in env_cells:
+                    if (r, c) not in all_allocated_cells:
+                        cell = new_ws.cell(row=r, column=c)
+                        if not isinstance(cell, MergedCell) and cell.value != "CT":
+                            snap = original_snapshot.get((r, c))
+                            if snap:
+                                cell.value = snap['value']
+                                if snap['fill']:
+                                    cell.fill = snap['fill']
+                                if snap['font']:
+                                    cell.font = snap['font']
+
+                ambientes_criados_info.append(
+                    f"- Criado Novo Ambiente Fechado no Bloco '{bloco_id}', Ambiente '{reserva['ambiente_letra']}' "
+                    f"com {len(allocated_ambiente)} PAs operacionais"
+                    + (f" + sala fechada de {len(allocated_sala)} lugares" if allocated_sala else "")
+                    + f" para o cliente '{cliente_dest}'."
+                )
+                print(f"   Ambiente fisico em lote criado para {cliente_dest}: {len(allocated_ambiente)} PAs")
+
+            new_wb.save(dest_file)
 
     # Salva a planilha intermediária (para garantir as alterações físicas das paredes)
     new_wb.save(dest_file)
 
-    # === RECONCILIAÇÃO MATEMÁTICA DE INVENTÁRIO (GARANTE SOMA ZERO) ===
-    print("⚖️ Reconciliando inventário global para garantir consistência física...")
-    
-    # 1. Popular estilos de preenchimento e fontes dos clientes (Busca unificada e robusta)
-    client_fills = {}
-    client_fonts = {}
-    
-    # Primeiro busca na original para ter os estilos dos estáveis/reduzidos
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(row=r, column=c)
-            v = cell.value
-            if v is not None:
-                norm_v = normalize_val(v)
-                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
-                    if cell.fill and cell.fill.patternType == 'solid':
-                        client_fills[norm_v] = copy(cell.fill)
-                    if cell.font:
-                        client_fonts[norm_v] = copy(cell.font)
-                        
-    # Depois busca na modificada para capturar os estilos gerados pelo LayoutEngine para novos clientes
-    for r in range(1, new_ws.max_row + 1):
-        for c in range(1, new_ws.max_column + 1):
-            cell = new_ws.cell(row=r, column=c)
-            v = cell.value
-            if v is not None:
-                norm_v = normalize_val(v)
-                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
-                    if cell.fill and cell.fill.patternType == 'solid':
-                        client_fills[norm_v] = copy(cell.fill)
-                    if cell.font:
-                        client_fonts[norm_v] = copy(cell.font)
-
-    paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
-    default_new_fills = {}
-    default_new_fonts = {}
-    for idx, nc in enumerate(parametros_premissas["novos_clientes"]):
-        nome = nc["nome"]
-        cor_hex = paleta_cores[idx % len(paleta_cores)]
-        default_new_fills[nome] = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
-        default_new_fonts[nome] = Font(color='FFFFFF', bold=True, size=8)
-
-    # 2. Determinar as metas esperadas (targets) de cada cliente
-    expected_targets = {}
-    orig_counts = {}
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            if (r, c) not in allowed_cells:
-                continue
-            val = ws.cell(row=r, column=c).value
-            if val is not None:
-                norm_val = normalize_val(val)
-                if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
-                    orig_counts[norm_val] = orig_counts.get(norm_val, 0) + 1
-                    
-    for client, qty in orig_counts.items():
-        if client in parametros_premissas["reducoes"]:
-            expected_targets[client] = qty - parametros_premissas["reducoes"][client]
-        else:
-            expected_targets[client] = qty
-        
-    # MODIFICAÇÃO: Deduz as mesas em branco das salas de reunião da contagem de mesas ativas exigidas
-    for nc in parametros_premissas["novos_clientes"]:
-        nome = nc["nome"]
-        target_pas = nc["PAs"]
-        for amb in criar_ambientes_solicitados:
-            if amb.get("cliente_destinado") == nome:
-                target_pas -= amb.get("sala_lugares", 0)
-        expected_targets[nome] = target_pas
-        
-    # 3. Mapear as coordenadas das novas salas com base na presença física do cliente destino
-    room_cells_by_client = {}
-    if criar_ambientes_solicitados:
-        import ScannerPremissas
-        ScannerPremissas._orange_context_cache = {}
-        macro_blocks_reconcile = scan_orange_context(dest_file, SHEET_NAME)
-        for amb in criar_ambientes_solicitados:
-            bloco_id = amb.get("bloco")
-            cliente_dest = amb.get("cliente_destinado")
-            
-            block_match = re.search(r'\d+', str(bloco_id))
-            if block_match:
-                block_idx = int(block_match.group())
-                if block_idx <= len(macro_blocks_reconcile):
-                    block = macro_blocks_reconcile[block_idx - 1]
-                    for env in block.get('ambientes', []):
-                        client_presence = sum(
-                            1 for coord in env['cells'] 
-                            if new_ws.cell(row=coord[0], column=coord[1]).value == cliente_dest
-                        )
-                        if client_presence > 0:
-                            room_cells_by_client.setdefault(cliente_dest, set()).update(env['cells'])
-
-    # 4. Obter contagem atual na planilha modificada
-    def get_actual_counts(sheet):
-        counts = {}
-        for r in range(1, sheet.max_row + 1):
-            for c in range(1, sheet.max_column + 1):
-                if (r, c) not in allowed_cells:
-                    continue
-                val = sheet.cell(row=r, column=c).value
-                if val is not None:
-                    norm_val = normalize_val(val)
-                    if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
-                        counts[norm_val] = counts.get(norm_val, 0) + 1
-        return counts
-
-    actual_counts = get_actual_counts(new_ws)
-    
-    # 5. Ajustar excessos (limpar duplicatas criadas fora das salas físicas oficiais)
-    for client, target in expected_targets.items():
-        actual = actual_counts.get(client, 0)
-        if actual > target:
-            diff = actual - target
-            client_cells = []
-            for r in range(1, new_ws.max_row + 1):
-                for c in range(1, new_ws.max_column + 1):
-                    if (r, c) not in allowed_cells:
-                        continue
-                    val = new_ws.cell(row=r, column=c).value
-                    if val is not None and normalize_val(val) == client:
-                        dedicated_cells = room_cells_by_client.get(client, set())
-                        if (r, c) not in dedicated_cells:
-                            client_cells.append((r, c))
-            
-            for r, c in sorted(client_cells, key=lambda x: (x[1], x[0]))[:diff]:
-                new_ws.cell(row=r, column=c).value = 'vazio'
-                new_ws.cell(row=r, column=c).fill = FILL_LIBERADO
-                new_ws.cell(row=r, column=c).font = FONT_SMALL
-            
-    # Re-computa contagens antes de suprir déficits
-    actual_counts = get_actual_counts(new_ws)
-    
-    # 6. Ajustar déficits (alocar assentos em vazios aplicando os estilos corretos preservados)
-    for client, target in expected_targets.items():
-        actual = actual_counts.get(client, 0)
-        if actual < target:
-            diff = target - actual
-            vazio_cells = []
-            for r in range(1, new_ws.max_row + 1):
-                for c in range(1, new_ws.max_column + 1):
-                    if (r, c) not in allowed_cells:
-                        continue
-                    val = new_ws.cell(row=r, column=c).value
-                    if val is None or normalize_val(val) in ('VAZIO', ''):
-                        vazio_cells.append((r, c))
-            
-            vazio_cells.sort(key=lambda x: (x[1], x[0]))
-            
-            fill_to_apply = client_fills.get(client) or default_new_fills.get(client, FILL_NEW_CLIENT)
-            font_to_apply = client_fonts.get(client) or default_new_fonts.get(client) or (FONT_WHITE if client.startswith("N_") else FONT_SMALL)
-            
-            for r, c in vazio_cells[:diff]:
-                new_ws.cell(row=r, column=c).value = client
-                new_ws.cell(row=r, column=c).fill = fill_to_apply
-                new_ws.cell(row=r, column=c).font = font_to_apply
-                
-    # Salva a planilha reconciliada final
+    inventory_cells, parametros_validacao = reconciliar_inventario(
+        ws=ws,
+        new_ws=new_ws,
+        allowed_cells=allowed_cells,
+        salas_internas_cells=salas_internas_cells,
+        parametros=parametros_premissas,
+        ambientes=criar_ambientes_solicitados,
+        ambientes_falhos=ambientes_fisicos_falhos,
+        dest_file=dest_file,
+        sheet_name=SHEET_NAME,
+    )
     new_wb.save(dest_file)
     print("⚖️ Inventário reconciliado com sucesso! Iniciando validação física...")
 
-    # Re-scan dos blocos e paredes laranjas (ScannerPremissas) para forçar o remapeamento dinâmico
     import ScannerPremissas
     ScannerPremissas._orange_context_cache = {}
-    
-    # Ajusta os parâmetros de validação para que desconsidere as mesas em branco das salas de reunião
-    adjusted_novos_clientes = []
-    for nc in parametros_premissas["novos_clientes"]:
-        nome = nc["nome"]
-        pas_originais = nc["PAs"]
-        # Deduz os assentos em branco das salas de reunião correspondentes
-        for amb in criar_ambientes_solicitados:
-            if amb.get("cliente_destinado") == nome:
-                pas_originais -= amb.get("sala_lugares", 0)
-        adjusted_novos_clientes.append({
-            "nome": nome,
-            "PAs": pas_originais
-        })
-        
-    parametros_validacao = {
-        "reducoes": parametros_premissas["reducoes"],
-        "novos_clientes": adjusted_novos_clientes
-    }
-    
     ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
-    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_validacao)
+    erros_validacao = validar_inventario(ws, new_ws, inventory_cells, parametros_validacao)
 
     # Salva auditoria do posicionador
     salvar_auditoria("1_posicionador", (
@@ -623,7 +674,7 @@ async def main():
             )
         
         res_organizador = await organizador.run(
-            f"Avalie a planta física atual. Se houver qualquer violação de premissas (como unificação, exclusividade, novo cliente desalinhado de sua sala física), utilize a função 'transferir' para corrigir. Se estiver tudo certo, retorne a lista vazia.{feedback_erros}",
+            f"Audite cada premissa de forma neutra e baseada em evidencias. Declare status_auditoria, evidencias e violacoes. Proponha transferencias somente para falhas que elas realmente corrigem.{feedback_erros}",
             deps=org_deps
         )
         reorganizacao_json = clean_json_string(res_organizador.output)
@@ -638,15 +689,35 @@ async def main():
         
         org_data = extrair_e_carregar_json(reorganizacao_json)
         acoes_org = org_data.get("acoes_organizacao", [])
-        
+        status_auditoria = str(org_data.get("status_auditoria", "inconclusivo")).strip().lower()
+        violacoes_auditoria = org_data.get("violacoes_detectadas", [])
+
         if not acoes_org and not erros_validacao:
-            print(f"✓ Sistema auditado e validado. Todas as premissas e inventários estão plenamente satisfatórios!")
+            if status_auditoria == "conforme" and not violacoes_auditoria:
+                print("✓ Auditoria concluida como conforme, com evidencias registradas.")
+            else:
+                print(
+                    f"⚠ Auditoria encerrada como '{status_auditoria}': "
+                    f"{len(violacoes_auditoria)} violacao(oes) ou lacuna(s) registrada(s)."
+                )
+                erro_auditoria = (
+                    f"Auditoria terminou como '{status_auditoria}' "
+                    f"com {len(violacoes_auditoria)} apontamento(s)."
+                )
+                erros_validacao.append(erro_auditoria)
+                log_acumulado.setdefault('avisos', []).append(erro_auditoria)
             break
             
         print(f"   ⚠ Validando ações corretivas em sandbox...")
         
         acoes_iteracao = []
         for ac in acoes_org:
+            tipo = str(ac.get("tipo", "")).strip().lower()
+            if tipo != "transferir":
+                raise ValueError(
+                    f"Acao invalida do organizador: '{tipo}'. "
+                    "O organizador so pode transferir."
+                )
             acoes_iteracao.append(Acao(**ac))
             
         acoes_iteracao = normalizar_acoes(acoes_iteracao, parametros_premissas["novos_clientes"])
@@ -656,7 +727,7 @@ async def main():
         sandbox_wb, sandbox_ws = clone_ws(new_ws)
         log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells, file_path=dest_file)
         
-        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_validacao)
+        erros_validacao_temp = validar_inventario(ws, sandbox_ws, inventory_cells, parametros_validacao)
         
         if not erros_validacao_temp:
             print(f"   ✓ Correção da Iteração {iteracao} validada com sucesso! Consolidando alterações físicas...")
@@ -710,7 +781,10 @@ async def main():
         f.write("================================================================================\n\n")
         f.write(final_blocos_info)
         
-    print(f"✓ Processo concluído com sucesso. Arquivos gravados em 'propostas/'.")
+    if erros_validacao:
+        print("⚠ Processo concluido com pendencias de auditoria. Consulte os relatorios em 'propostas/'.")
+    else:
+        print("✓ Processo concluido com auditoria conforme. Arquivos gravados em 'propostas/'.")
 
 if __name__ == '__main__':
     asyncio.run(main())

@@ -1,11 +1,13 @@
 # ScannerPremissas.py
 
+import os
 import openpyxl
 from collections import defaultdict, deque
 from typing import Dict, List, Tuple, Set
 
 # Variável global de cache para evitar múltiplas leituras físicas do Excel
-_orange_context_cache = None
+# Chaveado por file_path para suportar múltiplos arquivos (planta.xlsx vs proposta_final.xlsx)
+_orange_context_cache = {}  # Dict[str, List[Dict]]
 
 def manhattan_distance(c1: Tuple[int, int], c2: Tuple[int, int]) -> int:
     return abs(c1[0] - c2[0]) + abs(c1[1] - c2[1])
@@ -119,17 +121,35 @@ def cell_has_orange_border_or_fill(cell) -> bool:
     return cell_has_orange_fill(cell) or cell_has_orange_border(cell)
 
 def is_desk_cell(cell) -> bool:
+    """Verifica de forma dinâmica se a célula representa uma mesa de operador."""
     if cell is None or cell.value is None:
         return False
     val_str = str(cell.value).strip()
     val_upper = val_str.upper()
+    if not val_upper:
+        return False
+        
+    # Barreiras físicas conhecidas não são mesas
+    if val_upper in ('##', 'SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS'):
+        return False
+        
+    # Valores numéricos > 9 são anotações de capacidade, não assentos individuais
     try:
-        float(val_upper)
+        val_num = float(val_upper)
+        if val_num > 9:
+            return False
         return True
     except ValueError:
         pass
-    if val_upper in ('VAZIO', 'T', "T'", 'ADM', 'I', 'Q'):
+        
+    # Novos clientes (ex: N_1, N_2) e marcas estáveis são considerados mesas
+    if val_upper.startswith("N_") or val_upper in ('VAZIO', 'T', "T'", 'ADM', 'I', 'Q'):
         return True
+        
+    # Identificadores alfanuméricos curtos adicionais
+    if len(val_upper) <= 15:
+        return True
+        
     return False
 
 def is_barrier_cell(cell) -> bool:
@@ -148,17 +168,40 @@ def is_barrier_cell(cell) -> bool:
             return True
     return False
 
-def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col: int) -> Set[Tuple[int, int]]:
+def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col: int, max_gap: int = 1) -> Set[Tuple[int, int]]:
+    """
+    Calcula quais células estão no interior do contorno laranja via BFS a partir das bordas
+    da planilha inteira, atravessando tudo que não seja parede.
+
+    Usa a mesma tolerância `max_gap` do agrupamento de macro-blocos (scan_orange_context) para
+    dilatar virtualmente a parede: qualquer célula a até `max_gap` de distância Manhattan de uma
+    célula de borda real é tratada como bloqueio durante a travessia externa. Isso evita que o
+    BFS "vaze" por pequenos buracos de 1 célula na parede física (comuns em plantas desenhadas
+    manualmente) e classifique erroneamente uma faixa interior como exterior.
+
+    Importante: a dilatação só afeta a travessia (blocking); o resultado final de `interior`
+    continua excluindo apenas as células de borda reais (border_cells), então as células do
+    "buraco" tratado como bloqueio acabam corretamente incluídas no interior (nunca alcançadas
+    pelo BFS externo, e não fazem parte da parede real).
+    """
+    blocking = set(border_cells)
+    if max_gap > 0:
+        for (r, c) in border_cells:
+            for dr in range(-max_gap, max_gap + 1):
+                for dc in range(-max_gap, max_gap + 1):
+                    if abs(dr) + abs(dc) <= max_gap:
+                        blocking.add((r + dr, c + dc))
+
     visited = set()
     queue = deque()
     for r in (1, max_row):
         for c in range(1, max_col + 1):
-            if (r, c) not in border_cells:
+            if (r, c) not in blocking:
                 queue.append((r, c))
                 visited.add((r, c))
     for c in (1, max_col):
         for r in range(1, max_row + 1):
-            if (r, c) not in border_cells and (r, c) not in visited:
+            if (r, c) not in blocking and (r, c) not in visited:
                 queue.append((r, c))
                 visited.add((r, c))
     while queue:
@@ -166,7 +209,7 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nr, nc = r + dr, c + dc
             if 1 <= nr <= max_row and 1 <= nc <= max_col:
-                if (nr, nc) not in border_cells and (nr, nc) not in visited:
+                if (nr, nc) not in blocking and (nr, nc) not in visited:
                     visited.add((nr, nc))
                     queue.append((nr, nc))
     interior = set()
@@ -177,11 +220,24 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
                 interior.add(coord)
     return interior
 
+def _anotacoes_proximas(cells, all_cells_cache):
+    """Coleta anotacoes em raio Manhattan 2 ao redor de um conjunto de celulas."""
+    textos = set()
+    for r, c in cells:
+        for dr in range(-2, 3):
+            for dc in range(-2, 3):
+                if abs(dr) + abs(dc) > 2:
+                    continue
+                vizinha = all_cells_cache.get((r + dr, c + dc))
+                if vizinha and is_text_annotation(vizinha.value):
+                    textos.add(str(vizinha.value).strip())
+    return textos
+
 def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
     global _orange_context_cache
-    # Retorna o contexto estruturado em cache se já foi lido uma vez
-    if _orange_context_cache is not None:
-        return _orange_context_cache
+    cache_key = os.path.abspath(file_path)
+    if cache_key in _orange_context_cache:
+        return _orange_context_cache[cache_key]
 
     wb = openpyxl.load_workbook(file_path, data_only=True)
     ws = wb[sheet_name]
@@ -235,21 +291,14 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
     macro_blocks = []
     valid_groups = [coords for coords in groups.values() if len(coords) >= 10]
     
-    # ══════════════════════════════════════════════════════════════════════════
-    # ORDENAÇÃO ROBUSTA: TOP-TO-BOTTOM (LINHAS) E LEFT-TO-RIGHT (COLUNAS)
-    # ══════════════════════════════════════════════════════════════════════════
-    # 1. Pré-calcula os limites mínimos de linha e coluna para cada bloco
     valid_groups_meta = []
     for coords in valid_groups:
         min_r = min(r for r, c in coords)
         min_c = min(c for r, c in coords)
         valid_groups_meta.append((min_r, min_c, coords))
         
-    # 2. Ordena preliminarmente de cima para baixo (pela linha inicial)
     valid_groups_meta.sort(key=lambda x: x[0])
     
-    # 3. Agrupa os blocos em "bandas horizontais" virtuais usando uma tolerância vertical (ex: 15 linhas)
-    # Isso evita que pequenos desalinhamentos de desenho (ex: linha 5 vs linha 6) quebrem a ordem horizontal
     bands = []
     current_band = []
     row_tolerance = 15
@@ -258,7 +307,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         if not current_band:
             current_band.append(item)
         else:
-            # Se o bloco atual começa muito próximo do primeiro bloco desta banda, agrupamos na mesma linha de leitura
             if item[0] - current_band[0][0] <= row_tolerance:
                 current_band.append(item)
             else:
@@ -267,18 +315,16 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
     if current_band:
         bands.append(current_band)
         
-    # 4. Ordena cada banda interna da esquerda para a direita (por coluna) e reconstrói a lista de grupos
     valid_groups = []
     for band in bands:
         band.sort(key=lambda x: x[1])
         for item in band:
             valid_groups.append(item[2])
-    # ══════════════════════════════════════════════════════════════════════════
     
     idx_counter = 1
     for coords in valid_groups:
         coords_set = set(coords)
-        interior_raw = get_interior_cells(coords_set, ws.max_row, ws.max_column)
+        interior_raw = get_interior_cells(coords_set, ws.max_row, ws.max_column, max_gap=max_gap)
         
         boundary_seats = set()
         for r, c in coords_set:
@@ -382,17 +428,7 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                 env_r_max = max(r for r, c in env_cells)
                 env_c_min = min(c for r, c in env_cells)
                 env_c_max = max(c for r, c in env_cells)
-                env_texts = set()
-                for (r, c) in env_cells:
-                    for dr in range(-2, 3):
-                        for dc in range(-2, 3):
-                            if abs(dr) + abs(dc) <= 2:
-                                nr, nc = r + dr, c + dc
-                                neighbor_cell = all_cells_cache.get((nr, nc))
-                                if neighbor_cell:
-                                    val = neighbor_cell.value
-                                    if is_text_annotation(val):
-                                        env_texts.add(str(val).strip())
+                env_texts = _anotacoes_proximas(env_cells, all_cells_cache)
                 ambientes.append({
                     'id': chr(64 + sub_idx),
                     'bounding_box': (env_r_min, env_r_max, env_c_min, env_c_max),
@@ -400,17 +436,7 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                     'texts': sorted(list(env_texts))
                 })
         else:
-            env_texts = set()
-            for (r, c) in interior_cells:
-                for dr in range(-2, 3):
-                    for dc in range(-2, 3):
-                        if abs(dr) + abs(dc) <= 2:
-                            nr, nc = r + dr, c + dc
-                            neighbor_cell = all_cells_cache.get((nr, nc))
-                            if neighbor_cell:
-                                val = neighbor_cell.value
-                                if is_text_annotation(val):
-                                    env_texts.add(str(val).strip())
+            env_texts = _anotacoes_proximas(interior_cells, all_cells_cache)
             ambientes.append({
                 'id': "A",
                 'bounding_box': (r_min_macro, r_max_macro, c_min_macro, c_max_macro),
@@ -427,23 +453,5 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         })
         idx_counter += 1
             
-    _orange_context_cache = macro_blocks
-    return _orange_context_cache
-
-def build_context_string_for_llm(macro_blocks: List[Dict]) -> str:
-    if not macro_blocks:
-        return "Nenhum macro-bloco laranja encontrado."
-    linhas = ["=== PREMISSAS E CONTEXTO EXTRAÍDOS DAS BORDAS LARANJAS ==="]
-    for b in macro_blocks:
-        b_id = b['id']
-        linhas.append(f"\n{b_id}:")
-        if b['texts']:
-            linhas.append("  📌 Anotações na borda do bloco:")
-            for txt in b['texts']:
-                linhas.append(f"    - {txt}")
-        for env in b.get('ambientes', []):
-            if env.get('texts'):
-                linhas.append(f"  Ambiente {b_id}-{env['id']}:")
-                for txt in env['texts']:
-                    linhas.append(f"    - '{txt}'")
-    return "\n".join(linhas)
+    _orange_context_cache[cache_key] = macro_blocks
+    return _orange_context_cache[cache_key]
