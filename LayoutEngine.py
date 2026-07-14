@@ -160,7 +160,7 @@ def build_blocos_info(plant_data, ws_max_row, ws_max_col, ws=None, file_path='pl
     if ws is None:
         return "Nenhum bloco laranja mapeado."
         
-    macro_blocks = scan_orange_context(file_path, SHEET_NAME)
+    macro_blocks = scan_orange_context(file_path, SHEET_NAME, ws=ws)
     allowed_cells = set()
     for r in range(1, ws.max_row + 1):
         for c in range(1, ws.max_column + 1):
@@ -289,7 +289,7 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
         default_new_fonts[nome] = Font(color='FFFFFF', bold=True, size=8)
 
     # --- REMOVIDO HARDCODE DO ARQUIVO ---
-    macro_blocks = scan_orange_context(file_path, SHEET_NAME)
+    macro_blocks = scan_orange_context(file_path, SHEET_NAME, ws=ws)
     non_client_values = {'VAZIO', 'CT', 'SA', 'SALA', 'CW', '##', ''}
     active_clients_cache = {v.upper() for v in cell_values.values() if v.upper() not in non_client_values}
     

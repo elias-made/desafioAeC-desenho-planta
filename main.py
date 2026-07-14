@@ -64,13 +64,13 @@ async def main():
     )
 
     # Extrai o contexto visual das bordas laranjas (necessário para o mapeamento de células permitidas)
-    dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME)
     
     # Consolida as diretrizes do sistema com o texto de entrada (as anotações visuais vão direto no bloco)
     premissas_completas = f"{premissas_txt}\n{regras_nomes_sistema}"
 
     # Carrega a planta original e escaneia os dados iniciais
     wb, ws = load_plant()
+    dados_laranjas = scan_orange_context('planta.xlsx', SHEET_NAME, ws=ws)
     
     # --- SNAPSHOT DA PLANILHA ORIGINAL (Restauração Perfeita de Inventário) ---
     original_snapshot = {}
@@ -249,10 +249,6 @@ async def main():
     # Os novos clientes com ambiente fechado sao posicionados pelo AmbienteBuilder.
     log_acumulado, _ = execute_alocacao(new_ws, proposta_inicial, plant_data, allowed_cells, file_path='planta.xlsx')
     
-    # SALVA A PLANILHA APÓS execute_alocacao - CRÍTICO!
-    # Isso garante que dest_file reflita as modificações em memória
-    new_wb.save(dest_file)
-    
     # === INTEGRAÇÃO DO AMBIENTEBUILDER ===
     ambientes_criados_info = []
     salas_internas_cells = set()
@@ -326,9 +322,7 @@ async def main():
                 font_to_apply = Font(color='FFFFFF', bold=True, size=8)
             return fill_to_apply, font_to_apply
 
-        import ScannerPremissas
-        ScannerPremissas._orange_context_cache = {}
-        macro_blocks_atual = scan_orange_context(dest_file, SHEET_NAME)
+        macro_blocks_atual = scan_orange_context(dest_file, SHEET_NAME, ws=new_ws)
 
         grupos_por_origem = {}
         for amb in criar_ambientes_solicitados:
@@ -596,10 +590,6 @@ async def main():
                 )
                 print(f"   Ambiente fisico em lote criado para {cliente_dest}: {len(allocated_ambiente)} PAs")
 
-            new_wb.save(dest_file)
-
-    # Salva a planilha intermediária (para garantir as alterações físicas das paredes)
-    new_wb.save(dest_file)
 
     inventory_cells, parametros_validacao = reconciliar_inventario(
         ws=ws,
@@ -612,11 +602,8 @@ async def main():
         dest_file=dest_file,
         sheet_name=SHEET_NAME,
     )
-    new_wb.save(dest_file)
     print("⚖️ Inventário reconciliado com sucesso! Iniciando validação física...")
 
-    import ScannerPremissas
-    ScannerPremissas._orange_context_cache = {}
     ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
     erros_validacao = validar_inventario(ws, new_ws, inventory_cells, parametros_validacao)
 
@@ -638,8 +625,7 @@ async def main():
         
         try:
             # O scan de blocos físicos é refeito de forma dinâmica na planilha modificada pelo AmbienteBuilder
-            current_wb = openpyxl.load_workbook(dest_file)
-            current_ws = current_wb[SHEET_NAME]
+            current_ws = new_ws
             
             current_plant_data = scan_plant(current_ws, FORBIDDEN_PATTERNS)
             current_plant_info = build_plant_info(current_plant_data)
@@ -742,8 +728,7 @@ async def main():
             acoes_totais.extend(acoes_iteracao)
             erros_validacao = []  
             
-            # Salva o arquivo intermediário após a rodada bem sucedida
-            new_wb.save(dest_file)
+
         else:
             print(f"   ❌ Correção inválida na Iteração {iteracao}. Executando rollback...")
             print("\n      ⚠️ DETALHES DAS INCONSISTÊNCIAS NO LAYOUT DO ORGANIZADOR:")

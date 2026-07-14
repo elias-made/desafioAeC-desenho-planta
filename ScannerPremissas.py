@@ -7,7 +7,23 @@ from typing import Dict, List, Tuple, Set
 
 # Variável global de cache para evitar múltiplas leituras físicas do Excel
 # Chaveado por file_path para suportar múltiplos arquivos (planta.xlsx vs proposta_final.xlsx)
-_orange_context_cache = {}  # Dict[str, List[Dict]]
+_orange_context_cache = {}
+
+
+def invalidate_orange_cache(ws=None, file_path=None):
+    """Invalida apenas a geometria alterada; sem argumentos, limpa todo o cache."""
+    global _orange_context_cache
+    if ws is None and file_path is None:
+        _orange_context_cache.clear()
+        return
+    prefixes = set()
+    if ws is not None:
+        prefixes.add(("worksheet", id(ws)))
+    if file_path is not None:
+        prefixes.add(("file", os.path.abspath(file_path)))
+    for key in list(_orange_context_cache):
+        if key[:2] in prefixes:
+            _orange_context_cache.pop(key, None)
 
 def manhattan_distance(c1: Tuple[int, int], c2: Tuple[int, int]) -> int:
     return abs(c1[0] - c2[0]) + abs(c1[1] - c2[1])
@@ -233,14 +249,23 @@ def _anotacoes_proximas(cells, all_cells_cache):
                     textos.add(str(vizinha.value).strip())
     return textos
 
-def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
+def scan_orange_context(
+    file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1,
+    ws=None,
+) -> List[Dict]:
+    """Mapeia a geometria laranja reutilizando uma worksheet ja aberta quando fornecida."""
     global _orange_context_cache
-    cache_key = os.path.abspath(file_path)
+    workbook_carregado = None
+    if ws is not None:
+        cache_key = ("worksheet", id(ws), sheet_name, max_gap)
+    else:
+        cache_key = ("file", os.path.abspath(file_path), sheet_name, max_gap)
     if cache_key in _orange_context_cache:
         return _orange_context_cache[cache_key]
 
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    ws = wb[sheet_name]
+    if ws is None:
+        workbook_carregado = openpyxl.load_workbook(file_path, data_only=True)
+        ws = workbook_carregado[sheet_name]
     orange_cells = set()
     cell_values = {}
     all_cells_cache = {}
@@ -257,7 +282,10 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                     cell_values[(r, c)] = val_str
 
     if not orange_cells:
-        return []
+        _orange_context_cache[cache_key] = []
+        if workbook_carregado is not None:
+            workbook_carregado.close()
+        return _orange_context_cache[cache_key]
 
     orange_list = list(orange_cells)
     n = len(orange_list)
@@ -454,4 +482,6 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
         idx_counter += 1
             
     _orange_context_cache[cache_key] = macro_blocks
-    return _orange_context_cache[cache_key]
+    if workbook_carregado is not None:
+        workbook_carregado.close()
+    return macro_blocks

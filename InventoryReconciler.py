@@ -7,7 +7,7 @@ from openpyxl.styles import Font, PatternFill
 
 import ScannerPremissas
 from LayoutEngine import FILL_LIBERADO, FILL_NEW_CLIENT, FONT_SMALL, FONT_WHITE
-from ScannerPremissas import normalize_val, scan_orange_context
+from ScannerPremissas import invalidate_orange_cache, normalize_val, scan_orange_context
 
 IGNORADOS = {'VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'}
 PALETA_NOVOS = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
@@ -57,8 +57,8 @@ def _metas(ws, allowed_cells, parametros, ambientes, falhos):
 
 
 def _ambientes_dedicados(dest_file, sheet_name, new_ws, ambientes):
-    ScannerPremissas._orange_context_cache = {}
-    blocos = scan_orange_context(dest_file, sheet_name)
+    invalidate_orange_cache(ws=new_ws)
+    blocos = scan_orange_context(dest_file, sheet_name, ws=new_ws)
     result = {}
     for ambiente in ambientes:
         bloco_match = re.search(r'\d+', str(ambiente.get('bloco')))

@@ -8,6 +8,8 @@ from CapacityValidator import avaliar_capacidade
 from PremiseNormalizer import normalizar_nomes_novos_por_ordem, normalizar_quantidades_ambientes
 from InventoryReconciler import reconciliar_inventario
 from AmbienteBuilder import _corredores_alcancaveis_da_saida
+from ScannerPremissas import invalidate_orange_cache, scan_orange_context
+from Agents import OrganizadorDeps
 
 
 class PremiseNormalizerTests(unittest.TestCase):
@@ -49,6 +51,27 @@ Criar espaço com 70 PAs no mesmo bloco do cliente com 124 PAs"""
         self.assertEqual(clientes[0]["PAs"], 165)
         self.assertEqual(ambientes[0]["quantidade_mesas"], 165)
 
+
+class AgentContractTests(unittest.TestCase):
+    def test_organizador_aceita_contexto_dos_ambientes_criados(self):
+        deps = OrganizadorDeps(
+            plant_info="planta", blocos_info="blocos", premissas="premissas",
+            rascunho_layout="rascunho", ambientes_criados="ambientes",
+        )
+        self.assertEqual(deps.ambientes_criados, "ambientes")
+
+class ScannerCacheTests(unittest.TestCase):
+    def test_scanner_em_memoria_nao_reabre_arquivo_e_respeita_invalidacao(self):
+        ws = Workbook().active
+        ws.cell(3, 3).value = ""
+        invalidate_orange_cache(ws=ws)
+        with patch("ScannerPremissas.openpyxl.load_workbook", side_effect=AssertionError("nao deve abrir arquivo")):
+            primeiro = scan_orange_context("inexistente.xlsx", "Sheet", ws=ws)
+            segundo = scan_orange_context("inexistente.xlsx", "Sheet", ws=ws)
+        self.assertIs(primeiro, segundo)
+        invalidate_orange_cache(ws=ws)
+        terceiro = scan_orange_context("inexistente.xlsx", "Sheet", ws=ws)
+        self.assertIsNot(primeiro, terceiro)
 
 class GeometryUtilityTests(unittest.TestCase):
     def test_corredores_internos_alcancam_a_saida(self):

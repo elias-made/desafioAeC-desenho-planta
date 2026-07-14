@@ -19,6 +19,7 @@ class OrganizadorDeps:
     blocos_info: str
     premissas: str
     rascunho_layout: str
+    ambientes_criados: str
 
 # ══════════════════════════════════════════════════════════════════════════
 # Inicialização dos Agentes (Fluxo Unificado de 2 Etapas)
@@ -48,6 +49,7 @@ organizador = Agent(
 def organizador_prompt(ctx: RunContext[OrganizadorDeps]) -> str:
     return Prompts.ORGANIZADOR_TMPL.format(
         rascunho_layout=ctx.deps.rascunho_layout,
+        ambientes_criados=ctx.deps.ambientes_criados,
         premissas=ctx.deps.premissas,
         blocos_info=ctx.deps.blocos_info
     )
