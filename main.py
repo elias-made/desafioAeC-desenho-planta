@@ -373,7 +373,14 @@ async def main():
                 allocated_sala = set()
                 room_cells_override = None
                 if sala_lugares and sala_lugares > 0:
-                    allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(ws_planejamento, env_cells, sala_lugares)
+                    ancora_ambiente = _selecionar_mesas_contiguas(
+                        env_cells, ws_planejamento, qtd_mesas,
+                        priorizar_sobras=bool(reservado_grupo),
+                    )
+                    allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(
+                        ws_planejamento, env_cells, sala_lugares,
+                        anchor_cells=ancora_ambiente,
+                    )
                     if room_cells_override:
                         salas_internas_cells.update(room_cells_override)
 
@@ -385,6 +392,44 @@ async def main():
                     qtd_mesas,
                     priorizar_sobras=bool(reservado_grupo),
                 )
+
+                if room_cells_set and allocated_ambiente:
+                    # A sala pode se ligar ao salao por um pequeno corredor livre.
+                    # Exigir contato direto rejeitava layouts validos, como o N_1,
+                    # que possuia exatamente uma coluna de circulacao entre ambos.
+                    fronteira = {(coord, 0) for coord in room_cells_set}
+                    visitadas = set(room_cells_set)
+                    sala_encostada = False
+                    while fronteira and not sala_encostada:
+                        (r_atual, c_atual), distancia = fronteira.pop()
+                        if distancia >= 3:
+                            continue
+                        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            vizinha = (r_atual + dr, c_atual + dc)
+                            if vizinha not in env_cells or vizinha in visitadas:
+                                continue
+                            if _tem_parede_laranja_entre(
+                                ws_planejamento, r_atual, c_atual, vizinha[0], vizinha[1]
+                            ):
+                                continue
+                            if vizinha in allocated_ambiente:
+                                sala_encostada = True
+                                break
+                            # Somente celulas sem mesa podem servir de corredor.
+                            if not _eh_celula_de_mesa_local(
+                                ws_planejamento.cell(row=vizinha[0], column=vizinha[1])
+                            ):
+                                visitadas.add(vizinha)
+                                fronteira.add((vizinha, distancia + 1))
+
+                    if not sala_encostada:
+                        print(f"   Sala interna de {cliente_dest} ficou desconectada do novo ambiente.")
+                        ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                        ambientes_criados_info.append(
+                            f"- FALHA ao criar ambiente para '{cliente_dest}' no bloco '{bloco_id}': "
+                            "a sala interna nao ficou conectada ao salao principal."
+                        )
+                        continue
 
                 if allocated_ambiente and len(allocated_ambiente) < qtd_mesas:
                     msg = (

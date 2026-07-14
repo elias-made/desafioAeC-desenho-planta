@@ -483,7 +483,10 @@ def _classificar_celulas_sala(ws, env_cells: Set[Tuple[int, int]]):
             corridor_cells.add((r, c))
     return valid_cells, desk_cells, corridor_cells
 
-def _encontrar_melulo_retangulo_sala(ws, env_cells: Set[Tuple[int, int]], W: int, H: int, precomp=None) -> Tuple[int, int, Set[Tuple[int, int]]]:
+def _encontrar_melulo_retangulo_sala(
+    ws, env_cells: Set[Tuple[int, int]], W: int, H: int, precomp=None,
+    anchor_cells: Set[Tuple[int, int]] = None,
+) -> Tuple[int, int, Set[Tuple[int, int]]]:
     """Encontra o melhor retângulo W x H para a sala fechada, priorizando o corredor de ligação."""
     if not env_cells:
         return None, None, set()
@@ -578,14 +581,21 @@ def _encontrar_melulo_retangulo_sala(ws, env_cells: Set[Tuple[int, int]], W: int
                 touching_sides += 1
 
             conecta = 1 if _conecta(r_start, r_end, c_start, c_end) else 0
-            candidates.append((conecta, touching_sides, desks_destroyed, r_start, c_start, rect_cells))
+            distancia_ancora = 0
+            if anchor_cells:
+                distancia_ancora = min(
+                    abs(rr - ar) + abs(cc - ac)
+                    for rr, cc in rect_cells for ar, ac in anchor_cells
+                )
+            candidates.append((distancia_ancora, conecta, touching_sides, desks_destroyed, r_start, c_start, rect_cells))
 
     if not candidates:
         return None, None, set()
 
-    candidates.sort(key=lambda x: (-x[0], -x[1], x[2], x[3], x[4]))
+    # Com o salao ja planejado, sua proximidade e o criterio principal.
+    candidates.sort(key=lambda x: (x[0], -x[1], -x[2], x[3], x[4], x[5]))
 
-    for _conecta_flag, _touch, _destroyed, r_start, c_start, rect_cells in candidates:
+    for _dist, _conecta_flag, _touch, _destroyed, r_start, c_start, rect_cells in candidates:
         if _remocao_preserva_conectividade(env_cells, rect_cells):
             return r_start, c_start, rect_cells
 
@@ -657,7 +667,10 @@ def _gerar_bancadas_dinamicas(ws, env_cells: Set[Tuple[int, int]], N: int) -> Se
         
     return desks
 
-def _gerar_layout_sala_estruturado(ws, env_cells: Set[Tuple[int, int]], N: int) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
+def _gerar_layout_sala_estruturado(
+    ws, env_cells: Set[Tuple[int, int]], N: int,
+    anchor_cells: Set[Tuple[int, int]] = None,
+) -> Tuple[Set[Tuple[int, int]], Set[Tuple[int, int]]]:
     env_cells = set(env_cells) | _celulas_contorno_do_ambiente(ws, env_cells)
 
     if N <= 0:
@@ -682,7 +695,9 @@ def _gerar_layout_sala_estruturado(ws, env_cells: Set[Tuple[int, int]], N: int) 
             W, H, prof = _dims(orient, L)
             if 2 * L * prof < N:
                 continue
-            r, c, _rect = _encontrar_melulo_retangulo_sala(ws, env_cells, W, H, precomp=precomp)
+            r, c, _rect = _encontrar_melulo_retangulo_sala(
+                ws, env_cells, W, H, precomp=precomp, anchor_cells=anchor_cells
+            )
             if r is None:
                 continue
             chave = (max(W, H), W * H)
