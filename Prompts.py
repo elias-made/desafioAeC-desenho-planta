@@ -25,7 +25,10 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 2. NOVOS CLIENTES: Use apenas os nomes informados nas diretrizes de nomenclatura (ex: 'N_1', 'N_2').
 3. POSICIONAMENTO SIMPLIFICADO: Em todas as ações de `"acoes_primarias"` (seja 'liberar' ou 'realocar'), defina sempre `"bloco": "automatico"` e `"ambiente": "automatico"`. O motor físico fará a distribuição automática nas vagas.
 4. CRIAÇÃO DE AMBIENTES E SALAS: Se as premissas exigirem novos ambientes fechados (closed rooms) e/ou salas de reunião internas (salas de X lugares dentro deles), defina-os estritamente no nó 'criar_ambientes'. No caso de haver sala de reunião interna requerida dentro do espaço, você DEVE adicionar o campo 'sala_lugares': X no objeto desse ambiente. Se não for exigida nenhuma sala interna para aquele ambiente, omita ou defina 'sala_lugares': 0.
-5. CAPACIDADE PARA CRIAR AMBIENTES: Para decidir se uma criacao e viavel, faca a conta global de PAs liberadas/vazias contra a demanda total dos novos clientes. Nao descarte um bloco/ambiente de criacao so porque hoje ele esta ocupado por outro cliente.
+5. CAPACIDADE PARA CRIAR AMBIENTES: A conta global prova apenas viabilidade aritmetica, nao geometria continua para salao, sala, corredores e catraca.
+6. NEUTRALIDADE: Compare todos os blocos candidatos; nao favoreca a primeira opcao, o bloco com mais vazios ou exemplos.
+7. CATRACAS: Calcule a exigencia sem afirmar que o recurso foi criado; sua existencia sera auditada fisicamente.
+8. INCERTEZA: Sem dados suficientes, declare incerteza em vez de inventar capacidade, sala, acesso ou recurso.
 
 == CONTROLE DE INVENTÁRIO (SOMA ZERO CRÍTICA) ==
 - A quantidade total de PAs liberadas de um cliente antigo deve ser igual à redução solicitada.
@@ -93,33 +96,31 @@ Sua missão única é organizar o layout de acordo com as premissas utilizando e
 == MAPA DOS BLOCOS FÍSICOS (ATUALIZADO COM OS NOVOS LIMITES E PAREDES) ==
 {blocos_info}
 
-== REGRA CRÍTICA SOBRE NOVOS AMBIENTES ==
-ATENÇÃO: O motor físico (AmbienteBuilder) JÁ posicionou os novos clientes DENTRO das divisórias criadas.
-Após a criação das divisórias, o scanner RE-ESCANEIA o bloco e as LETRAS DOS AMBIENTES PODEM MUDAR.
-Se a lista de ambientes criados informar FALHA para algum novo cliente exigido nas premissas, isso e violacao obrigatoria. Nao declare a proposta correta enquanto esse cliente nao existir com a quantidade solicitada.
+== PROTOCOLO NEUTRO DE AUDITORIA ==
+`ambientes_criados`, o rascunho e as justificativas sao alegacoes a verificar, nao provas de conformidade.
 
-Exemplo: O posicionador solicitou "criar N_1 no Bloco_7-B", mas após criar as divisórias:
-- O scanner pode detectar o novo ambiente como Bloco_7-A, Bloco_7-C, ou qualquer outra letra
-- Isso é NORMAL e esperado
+Audite sem presumir sucesso ou falha:
+1. EXISTENCIA: cada novo cliente exigido aparece no mapa?
+2. INVENTARIO: a quantidade operacional e exatamente a solicitada?
+3. LOCALIZACAO: o bloco atende a premissa? Mudanca de letra nao e automaticamente normal nem erro.
+4. COMPONENTE FISICO: salao, sala e acesso formam um conjunto conectado? Sala separada exige evidencia de corredor interno.
+5. SALAS: confirme lugares, localizacao interna e preservacao das salas proibidas; nao deduza isso do rascunho.
+6. CATRACAS: aplique `ceil(PAs / 250)`, mas aprove somente recursos observados no ambiente ou acesso. Menos de 250 PAs NAO prova existencia de catraca.
+7. DIVISAO: enumere TODOS os clientes/equipes, inclusive nomes nao numericos. Se o mapa nao localizar todo o inventario, marque como inconclusivo.
+8. PRESERVACAO: diferencie inventario global de preservacao de salas e geometria.
 
-COMO VERIFICAR SE UM NOVO CLIENTE ESTÁ CORRETO:
-1. Verifique se o cliente está no BLOCO correto (ignore a letra do ambiente)
-2. Verifique se a QUANTIDADE de PAs está correta
-3. Se ambos estiverem corretos, NÃO FAÇA SWAP - o cliente já está no lugar certo!
-
-QUANDO FAZER SWAP:
-- Apenas quando houver violação real de premissas (exclusividade, unificação)
-- Apenas quando um cliente estiver no BLOCO errado
-- NUNCA faça swap apenas porque a letra do ambiente mudou
-
-== DIRETRIZES DE ATUAÇÃO (OBRIGATÓRIO) ==
-1. APENAS ORGANIZAR: Você NÃO pode criar novos clientes do zero ou alterar o inventário total (reduções/criações). Sua única função é mover pessoas para respeitar as regras (unificação, exclusividade de blocos, ou colocar novos clientes dentro de suas salas físicas recém-criadas).
-2. FUNÇÃO ÚNICA: Utilize estritamente o tipo `"transferir"` em suas ações. Não utilize `"liberar"` ou `"realocar"`.
-3. CONFIANÇA DO MAPA: Baseie-se unicamente no `{blocos_info}` para saber a posição física real de cada cliente antes de realizar uma transferência.
-4. NOVOS CLIENTES JÁ POSICIONADOS: Os novos clientes (N_1, N_2, N_3...) já foram posicionados pelo motor físico dentro de suas divisórias. Se a quantidade deles no BLOCO está correta, não faça swap.
-
+== DIRETRIZES DE ATUACAO ==
+1. Use somente `transferir` nas correcoes executaveis; nunca crie ou apague inventario.
+2. Reconheca lacunas do mapa: ausencia de evidencia significa `inconclusivo`, nao `conforme`.
+3. Nao favoreca a proposta anterior, relatos do motor ou a opcao sem swaps.
+4. Lista vazia de acoes significa apenas que nao ha transferencia executavel; nao significa conformidade.
+5. Registre cada falha em `violacoes_detectadas` com `premissa`, `evidencia` e `corrigivel_por_transferencia`; use lista vazia quando nenhuma falha for comprovada.
+6. Use `status_auditoria = "conforme"` somente com evidencia positiva para todas as premissas; `nao_conforme` para violacoes e `inconclusivo` para dados insuficientes.
 == FORMATO OBRIGATÓRIO DE RETORNO (JSON PURO) ==
 {{
+  "status_auditoria": "conforme | nao_conforme | inconclusivo",
+  "evidencias_verificadas": ["Evidencia objetiva observada no mapa"],
+  "violacoes_detectadas": [],
   "planejamento_de_capacidade_scratchpad": "Escreva passo a passo como cada ação de transferência/permuta sequencial mantém o balanço físico correto no bloco de destino.",
   "acoes_organizacao": [
     {{

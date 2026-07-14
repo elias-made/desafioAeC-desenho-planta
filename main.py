@@ -806,7 +806,7 @@ async def main():
             )
         
         res_organizador = await organizador.run(
-            f"Avalie a planta física atual. Se houver qualquer violação de premissas (como unificação, exclusividade, novo cliente desalinhado de sua sala física), utilize a função 'transferir' para corrigir. Se estiver tudo certo, retorne a lista vazia.{feedback_erros}",
+            f"Audite cada premissa de forma neutra e baseada em evidencias. Declare status_auditoria, evidencias e violacoes. Proponha transferencias somente para falhas que elas realmente corrigem.{feedback_erros}",
             deps=org_deps
         )
         reorganizacao_json = clean_json_string(res_organizador.output)
@@ -821,9 +821,23 @@ async def main():
         
         org_data = extrair_e_carregar_json(reorganizacao_json)
         acoes_org = org_data.get("acoes_organizacao", [])
-        
+        status_auditoria = str(org_data.get("status_auditoria", "inconclusivo")).strip().lower()
+        violacoes_auditoria = org_data.get("violacoes_detectadas", [])
+
         if not acoes_org and not erros_validacao:
-            print(f"✓ Sistema auditado e validado. Todas as premissas e inventários estão plenamente satisfatórios!")
+            if status_auditoria == "conforme" and not violacoes_auditoria:
+                print("✓ Auditoria concluida como conforme, com evidencias registradas.")
+            else:
+                print(
+                    f"⚠ Auditoria encerrada como '{status_auditoria}': "
+                    f"{len(violacoes_auditoria)} violacao(oes) ou lacuna(s) registrada(s)."
+                )
+                erro_auditoria = (
+                    f"Auditoria terminou como '{status_auditoria}' "
+                    f"com {len(violacoes_auditoria)} apontamento(s)."
+                )
+                erros_validacao.append(erro_auditoria)
+                log_acumulado.setdefault('avisos', []).append(erro_auditoria)
             break
             
         print(f"   ⚠ Validando ações corretivas em sandbox...")
@@ -899,7 +913,10 @@ async def main():
         f.write("================================================================================\n\n")
         f.write(final_blocos_info)
         
-    print(f"✓ Processo concluído com sucesso. Arquivos gravados em 'propostas/'.")
+    if erros_validacao:
+        print("⚠ Processo concluido com pendencias de auditoria. Consulte os relatorios em 'propostas/'.")
+    else:
+        print("✓ Processo concluido com auditoria conforme. Arquivos gravados em 'propostas/'.")
 
 if __name__ == '__main__':
     asyncio.run(main())
