@@ -1,6 +1,7 @@
 # main.py
 
 import asyncio
+import json
 import os
 import shutil
 import openpyxl
@@ -42,6 +43,53 @@ load_dotenv()
 # ══════════════════════════════════════════════════════════════════════════
 # Fluxo de Execução Principal (Unificado de 2 Etapas com Auto-Correção)
 # ══════════════════════════════════════════════════════════════════════════
+
+def _normalizar_nomes_novos_por_ordem(pos_data, premissas_txt):
+    """Vincula N_1, N_2... a ordem das solicitacoes no texto, nao a ordem da LLM."""
+    solicitacoes = []
+    for linha in premissas_txt.splitlines():
+        if not re.search(r"\bcriar\b", linha, re.IGNORECASE):
+            continue
+        match_pas = re.search(r"(\d+)(?:\s+nov[oa]s?)?\s*PAs?\b", linha, re.IGNORECASE)
+        if not match_pas:
+            continue
+        match_sala = re.search(
+            r"sala\s+(?:com\s+)?(\d+)\s*lug", linha, re.IGNORECASE
+        )
+        solicitacoes.append((int(match_pas.group(1)), int(match_sala.group(1)) if match_sala else 0))
+
+    ambientes = pos_data.get("criar_ambientes", [])
+    usados = set()
+    renomeacoes = {}
+    for indice, (pas_operacionais, sala_lugares) in enumerate(solicitacoes, start=1):
+        for posicao, ambiente in enumerate(ambientes):
+            if posicao in usados:
+                continue
+            qtd = int(ambiente.get("quantidade_mesas", 0) or 0)
+            sala = int(ambiente.get("sala_lugares", 0) or 0)
+            if sala == sala_lugares and qtd in (pas_operacionais, pas_operacionais + sala_lugares):
+                nome_antigo = normalize_val(ambiente.get("cliente_destinado"))
+                renomeacoes[nome_antigo] = f"N_{indice}"
+                usados.add(posicao)
+                break
+
+    if not renomeacoes:
+        return pos_data
+
+    for ambiente in ambientes:
+        nome = normalize_val(ambiente.get("cliente_destinado"))
+        if nome in renomeacoes:
+            ambiente["cliente_destinado"] = renomeacoes[nome]
+    for cliente in pos_data.get("gabarito", {}).get("novos_clientes", []):
+        if isinstance(cliente, dict):
+            nome = normalize_val(cliente.get("nome"))
+            if nome in renomeacoes:
+                cliente["nome"] = renomeacoes[nome]
+    for acao in pos_data.get("acoes_primarias", []):
+        nome = normalize_val(acao.get("cliente"))
+        if nome in renomeacoes:
+            acao["cliente"] = renomeacoes[nome]
+    return pos_data
 
 async def main():
     # 1. Carrega as premissas brutas do arquivo de texto
@@ -124,6 +172,8 @@ async def main():
     )
     rascunho_layout_json = clean_json_string(res_posicionador.output)
     pos_data = extrair_e_carregar_json(rascunho_layout_json)
+    pos_data = _normalizar_nomes_novos_por_ordem(pos_data, premissas_txt)
+    rascunho_layout_json = json.dumps(pos_data, ensure_ascii=False, indent=2)
     
     # Executa a alocação bruta na planilha master
     acoes_totais = []
@@ -158,18 +208,24 @@ async def main():
         
     novos_clientes_brutos = gabarito_dados.get("novos_clientes", [])
     novos_clientes_extraidos = []
+    pas_operacionais_explicitos = {}
     for nc in novos_clientes_brutos:
         if isinstance(nc, dict):
             nome_orig = nc.get("nome", "")
-            pas = nc.get("PAs", 0)
+            pas_explicitos = nc.get("PAs_operacionais")
+            pas = pas_explicitos if pas_explicitos is not None else nc.get("PAs", 0)
         else:
             nome_orig = str(nc)
+            pas_explicitos = None
             pas = 0
         nome_norm = nome_orig.upper().strip().replace(" ", "_")
+        pas_operacionais = int(pas or 0)
         novos_clientes_extraidos.append({
             "nome": nome_norm,
-            "PAs": int(pas or 0)
+            "PAs": pas_operacionais
         })
+        if pas_explicitos is not None:
+            pas_operacionais_explicitos[nome_norm] = pas_operacionais
         
     parametros_premissas = {
         "reducoes": {normalize_val(k): int(v or 0) for k, v in gabarito_dados.get("reducoes", {}).items()},
@@ -180,6 +236,30 @@ async def main():
     acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
         
     criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
+    # quantidade_mesas representa apenas PAs operacionais; a sala e somada separadamente.
+    # O campo explicito prevalece sobre um total equivocado produzido pela LLM.
+    for amb in criar_ambientes_solicitados:
+        cliente_amb = normalize_val(amb.get("cliente_destinado"))
+        amb["sala_lugares"] = max(0, int(amb.get("sala_lugares", 0) or 0))
+        if cliente_amb in pas_operacionais_explicitos:
+            amb["quantidade_mesas"] = pas_operacionais_explicitos[cliente_amb]
+        else:
+            quantidade_informada = max(0, int(amb.get("quantidade_mesas", 0) or 0))
+            sala_lugares = amb["sala_lugares"]
+            cadastro_cliente = next(
+                (nc for nc in parametros_premissas["novos_clientes"] if nc["nome"] == cliente_amb),
+                None,
+            )
+            # Compatibilidade com respostas do formato antigo, em que PAs e
+            # quantidade_mesas traziam o total ja incluindo a sala.
+            if (
+                sala_lugares > 0
+                and cadastro_cliente is not None
+                and cadastro_cliente["PAs"] == quantidade_informada
+            ):
+                quantidade_informada = max(0, quantidade_informada - sala_lugares)
+                cadastro_cliente["PAs"] = quantidade_informada
+            amb["quantidade_mesas"] = quantidade_informada
 
     # Somente mesas "vazio" e reducoes autorizadas financiam novas PAs.
     # Celulas em branco sao corredores/espaco de planilha, nao mesas.
@@ -621,6 +701,9 @@ async def main():
     # Salva a planilha intermediária (para garantir as alterações físicas das paredes)
     new_wb.save(dest_file)
 
+    # Inclui as mesas das salas criadas em celulas que nao eram PAs na planta original.
+    inventory_cells = set(allowed_cells) | set(salas_internas_cells)
+
     # === RECONCILIAÇÃO MATEMÁTICA DE INVENTÁRIO (GARANTE SOMA ZERO) ===
     print("⚖️ Reconciliando inventário global para garantir consistência física...")
     
@@ -723,7 +806,7 @@ async def main():
         counts = {}
         for r in range(1, sheet.max_row + 1):
             for c in range(1, sheet.max_column + 1):
-                if (r, c) not in allowed_cells:
+                if (r, c) not in inventory_cells:
                     continue
                 val = sheet.cell(row=r, column=c).value
                 if val is not None:
@@ -814,7 +897,7 @@ async def main():
     }
     
     ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
-    erros_validacao = validar_inventario(ws, new_ws, allowed_cells, parametros_validacao)
+    erros_validacao = validar_inventario(ws, new_ws, inventory_cells, parametros_validacao)
 
     # Salva auditoria do posicionador
     salvar_auditoria("1_posicionador", (
@@ -923,7 +1006,7 @@ async def main():
         sandbox_wb, sandbox_ws = clone_ws(new_ws)
         log_iter, _ = execute_alocacao(sandbox_ws, proposta_correcao, current_plant_data, allowed_cells, file_path=dest_file)
         
-        erros_validacao_temp = validar_inventario(ws, sandbox_ws, allowed_cells, parametros_validacao)
+        erros_validacao_temp = validar_inventario(ws, sandbox_ws, inventory_cells, parametros_validacao)
         
         if not erros_validacao_temp:
             print(f"   ✓ Correção da Iteração {iteracao} validada com sucesso! Consolidando alterações físicas...")

@@ -98,6 +98,65 @@ def _eh_pilar_ou_coluna(ws, r, c) -> bool:
         return True
     return False
 
+
+def _eh_pilar_preto_vazio(ws, r: int, c: int) -> bool:
+    """Identifica especificamente a celula vazia com preenchimento solido #000000."""
+    if r < 1 or r > ws.max_row or c < 1 or c > ws.max_column:
+        return False
+    cell = ws.cell(row=r, column=c)
+    if cell.value is not None and str(cell.value).strip():
+        return False
+    fill = cell.fill
+    if not fill or fill.patternType != "solid":
+        return False
+    rgb = str(fill.fgColor.rgb or fill.start_color.rgb or "").upper()
+    return rgb[-6:] == "000000"
+
+def _pilares_internos_ao_ambiente(ws, room_cells: Set[Tuple[int, int]]) -> Set[Tuple[int, int]]:
+    """Localiza pilares encerrados pelo ambiente, sem confundi-los com sua parede externa."""
+    if not room_cells:
+        return set()
+
+    min_r = min(r for r, _ in room_cells)
+    max_r = max(r for r, _ in room_cells)
+    min_c = min(c for _, c in room_cells)
+    max_c = max(c for _, c in room_cells)
+    externos: Set[Tuple[int, int]] = set()
+    fila: List[Tuple[int, int]] = []
+
+    for r in range(min_r, max_r + 1):
+        for c in (min_c, max_c):
+            if (r, c) not in room_cells and (r, c) not in externos:
+                externos.add((r, c))
+                fila.append((r, c))
+    for c in range(min_c, max_c + 1):
+        for r in (min_r, max_r):
+            if (r, c) not in room_cells and (r, c) not in externos:
+                externos.add((r, c))
+                fila.append((r, c))
+
+    indice = 0
+    while indice < len(fila):
+        r, c = fila[indice]
+        indice += 1
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            vizinho = (r + dr, c + dc)
+            nr, nc = vizinho
+            if not (min_r <= nr <= max_r and min_c <= nc <= max_c):
+                continue
+            if vizinho in room_cells or vizinho in externos:
+                continue
+            externos.add(vizinho)
+            fila.append(vizinho)
+
+    return {
+        (r, c)
+        for r in range(min_r, max_r + 1)
+        for c in range(min_c, max_c + 1)
+        if (r, c) not in room_cells
+        and (r, c) not in externos
+        and _eh_pilar_preto_vazio(ws, r, c)
+    }
 def _eh_faixa_livre(ws, env_cells: Set[Tuple[int, int]], r0, r1, c0, c1) -> bool:
     """Verifica se todas as células no retângulo são corredores livres."""
     if r0 < 1 or r1 > ws.max_row or c0 < 1 or c1 > ws.max_column:
@@ -1023,14 +1082,18 @@ def separar_ambiente_e_desenhar_divisorias(
                     cell.fill = PatternFill(fill_type=None) # <--- Remove cores residuais
                     cell.border = Border()                  # <--- Limpa as bordas internas
 
+    pilares_internos = _pilares_internos_ao_ambiente(ws, room_cells)
+    interior_com_pilares = room_cells | pilares_internos
+    resultado["pilares_internos"] = pilares_internos
+
     for r, c in room_cells:
-        if (r - 1, c) not in room_cells:
+        if (r - 1, c) not in interior_com_pilares:
             _aplicar_borda_espelhada(ws, r, c, 'top', side_style)
-        if (r + 1, c) not in room_cells:
+        if (r + 1, c) not in interior_com_pilares:
             _aplicar_borda_espelhada(ws, r, c, 'bottom', side_style)
-        if (r, c - 1) not in room_cells:
+        if (r, c - 1) not in interior_com_pilares:
             _aplicar_borda_espelhada(ws, r, c, 'left', side_style)
-        if (r, c + 1) not in room_cells:
+        if (r, c + 1) not in interior_com_pilares:
             _aplicar_borda_espelhada(ws, r, c, 'right', side_style)
 
     # Validação final

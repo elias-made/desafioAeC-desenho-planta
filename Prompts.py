@@ -24,7 +24,7 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 1. CLIENTES EXISTENTES: Limite-se aos nomes exatos apresentados em `{plant_info}` e `{blocos_info}`.
 2. NOVOS CLIENTES: Use apenas os nomes informados nas diretrizes de nomenclatura (ex: 'N_1', 'N_2').
 3. POSICIONAMENTO SIMPLIFICADO: Em todas as ações de `"acoes_primarias"` (seja 'liberar' ou 'realocar'), defina sempre `"bloco": "automatico"` e `"ambiente": "automatico"`. O motor físico fará a distribuição automática nas vagas.
-4. CRIAÇÃO DE AMBIENTES E SALAS: Se as premissas exigirem novos ambientes fechados (closed rooms) e/ou salas de reunião internas (salas de X lugares dentro deles), defina-os estritamente no nó 'criar_ambientes'. No caso de haver sala de reunião interna requerida dentro do espaço, você DEVE adicionar o campo 'sala_lugares': X no objeto desse ambiente. Se não for exigida nenhuma sala interna para aquele ambiente, omita ou defina 'sala_lugares': 0.
+4. CRIAÇÃO DE AMBIENTES E SALAS: Se as premissas exigirem novos ambientes fechados e/ou salas internas, defina-os no nó 'criar_ambientes'. REGRA MATEMÁTICA OBRIGATÓRIA: 'quantidade_mesas' e 'PAs_operacionais' representam SOMENTE as PAs fora da sala. 'sala_lugares' é separado e será somado uma única vez pelo motor. Exemplo: pedido de 124 PAs + sala de 4 lugares deve usar quantidade_mesas=124, PAs_operacionais=124, sala_lugares=4 e PAs_totais=128. Nunca coloque 128 em quantidade_mesas. Sem sala, use sala_lugares=0.
 5. CAPACIDADE PARA CRIAR AMBIENTES: Exija que PAs "vazio" + reducoes autorizadas seja maior ou igual a novas PAs + lugares das salas internas. Celulas em branco (`''`) NAO sao PAs nem capacidade. Se a conta nao fechar, declare inviavel; nunca remova clientes alem do solicitado.
 6. NEUTRALIDADE: Compare todos os blocos candidatos; nao favoreca a primeira opcao, o bloco com mais vazios ou exemplos.
 7. CATRACAS: Calcule a exigencia sem afirmar que o recurso foi criado; sua existencia sera auditada fisicamente.
@@ -32,7 +32,7 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 
 == CONTROLE DE INVENTÁRIO (SOMA ZERO CRÍTICA) ==
 - A quantidade total de PAs liberadas de um cliente antigo deve ser igual à redução solicitada.
-- A quantidade total de PAs de um novo cliente deve ser igual à demanda operacional + lugares de sua sala interna; essas mesas também recebem o nome do cliente.
+- A quantidade total de PAs de um novo cliente é PAs_operacionais + sala_lugares. Informe as duas parcelas separadamente e confira PAs_totais; nunca inclua a sala dentro de PAs_operacionais ou quantidade_mesas.
 
 == FORMATO OBRIGATÓRIO DE RETORNO (JSON PURO) ==
 {{
@@ -47,7 +47,8 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
     "novos_clientes": [
       {{
         "nome": "NOME_DO_NOVO_CLIENTE",
-        "PAs": 10
+        "PAs_operacionais": 10,
+        "PAs_totais": 14
       }}
     ]
   }},
