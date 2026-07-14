@@ -645,10 +645,11 @@ def validar_inventario(ws_orig, ws_new, allowed_cells, parametros: dict) -> List
         esperado = nc["PAs"]
         atual = new_counts.get(nome, 0)
         
-        if atual < esperado:
-            erros.append(f"Inconsistência no '{nome}': quantidade alocada ({atual}) é menor do que a quantidade mínima exigida ({esperado} PAs).")
-        elif atual > esperado + 10:
-            erros.append(f"Inconsistência no '{nome}': quantidade alocada ({atual}) excede o limite com tolerância de salas internas ({esperado + 10} PAs).")
+        if atual != esperado:
+            erros.append(
+                f"Inconsistência no '{nome}': quantidade alocada ({atual}) "
+                f"deve ser exatamente {esperado} PAs, incluindo mesas da sala interna."
+            )
             
     # 3. REDUÇÕES DE CLIENTES EXISTENTES (Mantido para garantir as metas de redução)
     for cli, reducao in parametros["reducoes"].items():

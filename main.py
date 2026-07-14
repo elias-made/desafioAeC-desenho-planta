@@ -110,9 +110,6 @@ async def main():
     dest_file = "propostas/proposta_final.xlsx"
     safe_name = "final"
     os.makedirs('propostas', exist_ok=True)
-    shutil.copy("planta.xlsx", dest_file)
-    new_wb = openpyxl.load_workbook(dest_file)
-    new_ws = new_wb[SHEET_NAME]
 
     pos_deps = PosicionadorDeps(
         plant_info=plant_info_str,
@@ -171,11 +168,11 @@ async def main():
         nome_norm = nome_orig.upper().strip().replace(" ", "_")
         novos_clientes_extraidos.append({
             "nome": nome_norm,
-            "PAs": pas
+            "PAs": int(pas or 0)
         })
         
     parametros_premissas = {
-        "reducoes": {normalize_val(k): v for k, v in gabarito_dados.get("reducoes", {}).items()},
+        "reducoes": {normalize_val(k): int(v or 0) for k, v in gabarito_dados.get("reducoes", {}).items()},
         "novos_clientes": novos_clientes_extraidos
     }
         
@@ -183,6 +180,73 @@ async def main():
     acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
         
     criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
+
+    # Somente mesas "vazio" e reducoes autorizadas financiam novas PAs.
+    # Celulas em branco sao corredores/espaco de planilha, nao mesas.
+    vazios_iniciais = sum(
+        1 for r, c in allowed_cells
+        if normalize_val(ws.cell(row=r, column=c).value) == "VAZIO"
+    )
+    reducoes_solicitadas = sum(
+        max(0, int(qtd or 0)) for qtd in parametros_premissas["reducoes"].values()
+    )
+    demanda_novos_pas = sum(
+        max(0, int(nc.get("PAs", 0) or 0))
+        for nc in parametros_premissas["novos_clientes"]
+    )
+    demanda_salas = sum(
+        max(0, int(amb.get("sala_lugares", 0) or 0))
+        for amb in criar_ambientes_solicitados
+    )
+    demanda_total = demanda_novos_pas + demanda_salas
+    capacidade_total = vazios_iniciais + reducoes_solicitadas
+
+    reducoes_invalidas = []
+    for cliente, reducao in parametros_premissas["reducoes"].items():
+        disponivel_cliente = len(plant_data["client_cells"].get(cliente, set()))
+        if reducao < 0 or reducao > disponivel_cliente:
+            reducoes_invalidas.append(
+                f"Cliente '{cliente}': reducao {reducao}, inventario {disponivel_cliente}."
+            )
+
+    if demanda_total > capacidade_total or reducoes_invalidas:
+        deficit = max(0, demanda_total - capacidade_total)
+        aviso_linhas = [
+            "PROCESSAMENTO NAO EXECUTADO: CAPACIDADE INSUFICIENTE", "",
+            f"PAs 'vazio' disponiveis: {vazios_iniciais}",
+            f"PAs autorizadas para eliminacao: {reducoes_solicitadas}",
+            f"Capacidade total: {capacidade_total}",
+            f"Novas PAs solicitadas: {demanda_novos_pas}",
+            f"Lugares em salas internas: {demanda_salas}",
+            f"Demanda total: {demanda_total}",
+            f"Deficit: {deficit}",
+        ]
+        if reducoes_invalidas:
+            aviso_linhas.extend(["", "Reducoes invalidas:", *reducoes_invalidas])
+        aviso_linhas.extend([
+            "", "Nenhuma alteracao foi aplicada a planta.",
+            "Celulas em branco nao sao consideradas PAs disponiveis.",
+        ])
+        aviso = "\n".join(aviso_linhas)
+        caminho_aviso = "propostas/aviso_inviabilidade.txt"
+        with open(caminho_aviso, "w", encoding="utf-8") as f:
+            f.write(aviso)
+        salvar_auditoria(
+            "1_posicionador_inviavel",
+            f"[PREMISSAS]\n{premissas_completas}\n\n[PLANO]\n{rascunho_layout_json}",
+            aviso, safe_name,
+        )
+        print(f"\n⚠ {aviso}\n\nAviso gravado em '{caminho_aviso}'.")
+        return
+
+    caminho_aviso = "propostas/aviso_inviabilidade.txt"
+    if os.path.exists(caminho_aviso):
+        os.remove(caminho_aviso)
+
+    # A copia de trabalho so nasce depois da aprovacao aritmetica.
+    shutil.copy("planta.xlsx", dest_file)
+    new_wb = openpyxl.load_workbook(dest_file)
+    new_ws = new_wb[SHEET_NAME]
     clientes_criados_por_parede = {
         normalize_val(amb.get("cliente_destinado"))
         for amb in criar_ambientes_solicitados
@@ -524,7 +588,7 @@ async def main():
                     origem_disponivel_por_chave[origem_key].difference_update(sala_room_cells)
 
                 fill_to_apply, font_to_apply = _estilo_cliente(cliente_dest)
-                for r, c in allocated_ambiente:
+                for r, c in allocated_ambiente | allocated_sala:
                     cell = new_ws.cell(row=r, column=c)
                     if not isinstance(cell, MergedCell) and cell.value != "CT":
                         cell.value = cliente_dest
@@ -620,7 +684,7 @@ async def main():
         else:
             expected_targets[client] = qty
         
-    # MODIFICAÇÃO: Deduz as mesas em branco das salas de reunião da contagem de mesas ativas exigidas
+    # Mesas das salas internas pertencem ao cliente e entram no inventario.
     for nc in parametros_premissas["novos_clientes"]:
         nome = nc["nome"]
         if nome in ambientes_fisicos_falhos:
@@ -628,7 +692,7 @@ async def main():
         target_pas = nc["PAs"]
         for amb in criar_ambientes_solicitados:
             if amb.get("cliente_destinado") == nome:
-                target_pas -= amb.get("sala_lugares", 0)
+                target_pas += amb.get("sala_lugares", 0)
         expected_targets[nome] = target_pas
         
     # 3. Mapear as coordenadas das novas salas com base na presença física do cliente destino
@@ -735,10 +799,10 @@ async def main():
         if nome in ambientes_fisicos_falhos:
             continue
         pas_originais = nc["PAs"]
-        # Deduz os assentos em branco das salas de reunião correspondentes
+        # Soma os lugares das salas internas ao inventario do cliente.
         for amb in criar_ambientes_solicitados:
             if amb.get("cliente_destinado") == nome:
-                pas_originais -= amb.get("sala_lugares", 0)
+                pas_originais += amb.get("sala_lugares", 0)
         adjusted_novos_clientes.append({
             "nome": nome,
             "PAs": pas_originais

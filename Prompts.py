@@ -25,14 +25,14 @@ Sua missão é realizar a alocação bruta inicial em 3 etapas sequenciais de ac
 2. NOVOS CLIENTES: Use apenas os nomes informados nas diretrizes de nomenclatura (ex: 'N_1', 'N_2').
 3. POSICIONAMENTO SIMPLIFICADO: Em todas as ações de `"acoes_primarias"` (seja 'liberar' ou 'realocar'), defina sempre `"bloco": "automatico"` e `"ambiente": "automatico"`. O motor físico fará a distribuição automática nas vagas.
 4. CRIAÇÃO DE AMBIENTES E SALAS: Se as premissas exigirem novos ambientes fechados (closed rooms) e/ou salas de reunião internas (salas de X lugares dentro deles), defina-os estritamente no nó 'criar_ambientes'. No caso de haver sala de reunião interna requerida dentro do espaço, você DEVE adicionar o campo 'sala_lugares': X no objeto desse ambiente. Se não for exigida nenhuma sala interna para aquele ambiente, omita ou defina 'sala_lugares': 0.
-5. CAPACIDADE PARA CRIAR AMBIENTES: A conta global prova apenas viabilidade aritmetica, nao geometria continua para salao, sala, corredores e catraca.
+5. CAPACIDADE PARA CRIAR AMBIENTES: Exija que PAs "vazio" + reducoes autorizadas seja maior ou igual a novas PAs + lugares das salas internas. Celulas em branco (`''`) NAO sao PAs nem capacidade. Se a conta nao fechar, declare inviavel; nunca remova clientes alem do solicitado.
 6. NEUTRALIDADE: Compare todos os blocos candidatos; nao favoreca a primeira opcao, o bloco com mais vazios ou exemplos.
 7. CATRACAS: Calcule a exigencia sem afirmar que o recurso foi criado; sua existencia sera auditada fisicamente.
 8. INCERTEZA: Sem dados suficientes, declare incerteza em vez de inventar capacidade, sala, acesso ou recurso.
 
 == CONTROLE DE INVENTÁRIO (SOMA ZERO CRÍTICA) ==
 - A quantidade total de PAs liberadas de um cliente antigo deve ser igual à redução solicitada.
-- A quantidade total de PAs realocadas para um novo cliente deve ser igual à demanda dele.
+- A quantidade total de PAs de um novo cliente deve ser igual à demanda operacional + lugares de sua sala interna; essas mesas também recebem o nome do cliente.
 
 == FORMATO OBRIGATÓRIO DE RETORNO (JSON PURO) ==
 {{
