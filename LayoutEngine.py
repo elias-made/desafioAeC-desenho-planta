@@ -3,7 +3,6 @@
 import os
 import re
 import json
-import shutil
 from copy import copy
 from typing import List, Set, Tuple
 
@@ -12,7 +11,7 @@ from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
 from ScannerPremissas import scan_orange_context, normalize_val
-from BlockMapper import scan_plant, flood_fill
+from BlockMapper import flood_fill
 
 # Configurações de planilha e constantes globais
 SHEET_NAME = 'JPIII'
@@ -352,20 +351,25 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
         if len(alocadas) < qtd: alocadas.extend([c for c in sorted(disp, key=lambda x: (x[1], x[0])) if c not in alocadas][:qtd - len(alocadas)])
         return alocadas
 
+    def resolve_action_location(acao):
+        block_id = acao.bloco
+        env_letter = acao.ambiente
+        if acao.novo_cliente:
+            if not block_id:
+                match = re.search(r'(?:vazio|Bloco)-\d+', acao.novo_cliente, re.IGNORECASE)
+                if match:
+                    block_id = match.group()
+            if not env_letter:
+                match = re.search(r'(?:vazio|Bloco)-\d+-+(.*)', acao.novo_cliente, re.IGNORECASE)
+                if match:
+                    env_letter = match.group(1).strip()
+        return block_id, env_letter
     # === FASE 1: REMOÇÃO ===
     for acao in acoes_liberar:
         alvo = acao.cliente.strip()
         alvo_norm = alvo.upper()
         
-        block_id = acao.bloco
-        if not block_id and acao.novo_cliente:
-            m_block = re.search(r'(?:vazio|Bloco)-\d+', acao.novo_cliente, re.IGNORECASE)
-            if m_block: block_id = m_block.group()
-                
-        env_letter = acao.ambiente
-        if not env_letter and acao.novo_cliente:
-            m_env = re.search(r'(?:vazio|Bloco)-\d+-+(.*)', acao.novo_cliente, re.IGNORECASE)
-            if m_env: env_letter = m_env.group(1).strip()
+        block_id, env_letter = resolve_action_location(acao)
         
         if not block_id or not env_letter or block_id.lower() == "automatico":
             env_vazios = []
@@ -427,15 +431,7 @@ def execute_alocacao(ws, proposta, plant_data, allowed_cells: Set[Tuple[int, int
     for acao in acoes_realocar:
         target = acao.cliente.strip()
         
-        block_id = acao.bloco
-        if not block_id and acao.novo_cliente:
-            m_block = re.search(r'(?:vazio|Bloco)-\d+', acao.novo_cliente, re.IGNORECASE)
-            if m_block: block_id = m_block.group()
-                
-        env_letter = acao.ambiente
-        if not env_letter and acao.novo_cliente:
-            m_env = re.search(r'(?:vazio|Bloco)-\d+-+(.*)', acao.novo_cliente, re.IGNORECASE)
-            if m_env: env_letter = m_env.group(1).strip()
+        block_id, env_letter = resolve_action_location(acao)
         
         cli_clean = target
         

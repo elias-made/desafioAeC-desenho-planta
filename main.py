@@ -8,7 +8,6 @@ import openpyxl
 import traceback
 import re
 from copy import copy
-from typing import List, Tuple
 from dotenv import load_dotenv
 from openpyxl.styles import PatternFill, Font
 from openpyxl.cell.cell import MergedCell
@@ -19,8 +18,7 @@ from LayoutEngine import (
     Acao, PropostaMock, clean_json_string, extrair_e_carregar_json,
     load_plant, clone_ws, build_plant_info, build_blocos_info,
     execute_alocacao, write_report, salvar_auditoria,
-    normalizar_acoes, validar_inventario, FILL_LIBERADO, FONT_SMALL,
-    FILL_NEW_CLIENT, FONT_WHITE
+    normalizar_acoes, validar_inventario
 )
 
 # Importando dependências do AmbienteBuilder
@@ -37,59 +35,18 @@ from AmbienteBuilder import (
 from Agents import PosicionadorDeps, OrganizadorDeps, posicionador, organizador
 from ScannerPremissas import scan_orange_context, normalize_val
 from BlockMapper import scan_plant
+from CapacityValidator import avaliar_capacidade
+from InventoryReconciler import reconciliar_inventario
+from PremiseNormalizer import (
+    normalizar_nomes_novos_por_ordem,
+    normalizar_quantidades_ambientes,
+)
 
 load_dotenv()
 
 # ══════════════════════════════════════════════════════════════════════════
 # Fluxo de Execução Principal (Unificado de 2 Etapas com Auto-Correção)
 # ══════════════════════════════════════════════════════════════════════════
-
-def _normalizar_nomes_novos_por_ordem(pos_data, premissas_txt):
-    """Vincula N_1, N_2... a ordem das solicitacoes no texto, nao a ordem da LLM."""
-    solicitacoes = []
-    for linha in premissas_txt.splitlines():
-        if not re.search(r"\bcriar\b", linha, re.IGNORECASE):
-            continue
-        match_pas = re.search(r"(\d+)(?:\s+nov[oa]s?)?\s*PAs?\b", linha, re.IGNORECASE)
-        if not match_pas:
-            continue
-        match_sala = re.search(
-            r"sala\s+(?:com\s+)?(\d+)\s*lug", linha, re.IGNORECASE
-        )
-        solicitacoes.append((int(match_pas.group(1)), int(match_sala.group(1)) if match_sala else 0))
-
-    ambientes = pos_data.get("criar_ambientes", [])
-    usados = set()
-    renomeacoes = {}
-    for indice, (pas_operacionais, sala_lugares) in enumerate(solicitacoes, start=1):
-        for posicao, ambiente in enumerate(ambientes):
-            if posicao in usados:
-                continue
-            qtd = int(ambiente.get("quantidade_mesas", 0) or 0)
-            sala = int(ambiente.get("sala_lugares", 0) or 0)
-            if sala == sala_lugares and qtd in (pas_operacionais, pas_operacionais + sala_lugares):
-                nome_antigo = normalize_val(ambiente.get("cliente_destinado"))
-                renomeacoes[nome_antigo] = f"N_{indice}"
-                usados.add(posicao)
-                break
-
-    if not renomeacoes:
-        return pos_data
-
-    for ambiente in ambientes:
-        nome = normalize_val(ambiente.get("cliente_destinado"))
-        if nome in renomeacoes:
-            ambiente["cliente_destinado"] = renomeacoes[nome]
-    for cliente in pos_data.get("gabarito", {}).get("novos_clientes", []):
-        if isinstance(cliente, dict):
-            nome = normalize_val(cliente.get("nome"))
-            if nome in renomeacoes:
-                cliente["nome"] = renomeacoes[nome]
-    for acao in pos_data.get("acoes_primarias", []):
-        nome = normalize_val(acao.get("cliente"))
-        if nome in renomeacoes:
-            acao["cliente"] = renomeacoes[nome]
-    return pos_data
 
 async def main():
     # 1. Carrega as premissas brutas do arquivo de texto
@@ -172,7 +129,7 @@ async def main():
     )
     rascunho_layout_json = clean_json_string(res_posicionador.output)
     pos_data = extrair_e_carregar_json(rascunho_layout_json)
-    pos_data = _normalizar_nomes_novos_por_ordem(pos_data, premissas_txt)
+    pos_data = normalizar_nomes_novos_por_ordem(pos_data, premissas_txt)
     rascunho_layout_json = json.dumps(pos_data, ensure_ascii=False, indent=2)
     
     # Executa a alocação bruta na planilha master
@@ -236,78 +193,21 @@ async def main():
     acoes_totais = normalizar_acoes(acoes_totais, parametros_premissas["novos_clientes"])
         
     criar_ambientes_solicitados = pos_data.get("criar_ambientes", [])
-    # quantidade_mesas representa apenas PAs operacionais; a sala e somada separadamente.
-    # O campo explicito prevalece sobre um total equivocado produzido pela LLM.
-    for amb in criar_ambientes_solicitados:
-        cliente_amb = normalize_val(amb.get("cliente_destinado"))
-        amb["sala_lugares"] = max(0, int(amb.get("sala_lugares", 0) or 0))
-        if cliente_amb in pas_operacionais_explicitos:
-            amb["quantidade_mesas"] = pas_operacionais_explicitos[cliente_amb]
-        else:
-            quantidade_informada = max(0, int(amb.get("quantidade_mesas", 0) or 0))
-            sala_lugares = amb["sala_lugares"]
-            cadastro_cliente = next(
-                (nc for nc in parametros_premissas["novos_clientes"] if nc["nome"] == cliente_amb),
-                None,
-            )
-            # Compatibilidade com respostas do formato antigo, em que PAs e
-            # quantidade_mesas traziam o total ja incluindo a sala.
-            if (
-                sala_lugares > 0
-                and cadastro_cliente is not None
-                and cadastro_cliente["PAs"] == quantidade_informada
-            ):
-                quantidade_informada = max(0, quantidade_informada - sala_lugares)
-                cadastro_cliente["PAs"] = quantidade_informada
-            amb["quantidade_mesas"] = quantidade_informada
-
-    # Somente mesas "vazio" e reducoes autorizadas financiam novas PAs.
-    # Celulas em branco sao corredores/espaco de planilha, nao mesas.
-    vazios_iniciais = sum(
-        1 for r, c in allowed_cells
-        if normalize_val(ws.cell(row=r, column=c).value) == "VAZIO"
+    normalizar_quantidades_ambientes(
+        criar_ambientes_solicitados,
+        parametros_premissas["novos_clientes"],
+        pas_operacionais_explicitos,
     )
-    reducoes_solicitadas = sum(
-        max(0, int(qtd or 0)) for qtd in parametros_premissas["reducoes"].values()
+    capacidade = avaliar_capacidade(
+        ws,
+        allowed_cells,
+        parametros_premissas["reducoes"],
+        parametros_premissas["novos_clientes"],
+        criar_ambientes_solicitados,
+        plant_data["client_cells"],
     )
-    demanda_novos_pas = sum(
-        max(0, int(nc.get("PAs", 0) or 0))
-        for nc in parametros_premissas["novos_clientes"]
-    )
-    demanda_salas = sum(
-        max(0, int(amb.get("sala_lugares", 0) or 0))
-        for amb in criar_ambientes_solicitados
-    )
-    demanda_total = demanda_novos_pas + demanda_salas
-    capacidade_total = vazios_iniciais + reducoes_solicitadas
-
-    reducoes_invalidas = []
-    for cliente, reducao in parametros_premissas["reducoes"].items():
-        disponivel_cliente = len(plant_data["client_cells"].get(cliente, set()))
-        if reducao < 0 or reducao > disponivel_cliente:
-            reducoes_invalidas.append(
-                f"Cliente '{cliente}': reducao {reducao}, inventario {disponivel_cliente}."
-            )
-
-    if demanda_total > capacidade_total or reducoes_invalidas:
-        deficit = max(0, demanda_total - capacidade_total)
-        aviso_linhas = [
-            "PROCESSAMENTO NAO EXECUTADO: CAPACIDADE INSUFICIENTE", "",
-            f"PAs 'vazio' disponiveis: {vazios_iniciais}",
-            f"PAs autorizadas para eliminacao: {reducoes_solicitadas}",
-            f"Capacidade total: {capacidade_total}",
-            f"Novas PAs solicitadas: {demanda_novos_pas}",
-            f"Lugares em salas internas: {demanda_salas}",
-            f"Demanda total: {demanda_total}",
-            f"Deficit: {deficit}",
-        ]
-        if reducoes_invalidas:
-            aviso_linhas.extend(["", "Reducoes invalidas:", *reducoes_invalidas])
-        aviso_linhas.extend([
-            "", "Nenhuma alteracao foi aplicada a planta.",
-            "Celulas em branco nao sao consideradas PAs disponiveis.",
-        ])
-        aviso = "\n".join(aviso_linhas)
+    if not capacidade.viavel:
+        aviso = capacidade.aviso()
         caminho_aviso = "propostas/aviso_inviabilidade.txt"
         with open(caminho_aviso, "w", encoding="utf-8") as f:
             f.write(aviso)
@@ -701,201 +601,22 @@ async def main():
     # Salva a planilha intermediária (para garantir as alterações físicas das paredes)
     new_wb.save(dest_file)
 
-    # Inclui as mesas das salas criadas em celulas que nao eram PAs na planta original.
-    inventory_cells = set(allowed_cells) | set(salas_internas_cells)
-
-    # === RECONCILIAÇÃO MATEMÁTICA DE INVENTÁRIO (GARANTE SOMA ZERO) ===
-    print("⚖️ Reconciliando inventário global para garantir consistência física...")
-    
-    # 1. Popular estilos de preenchimento e fontes dos clientes (Busca unificada e robusta)
-    client_fills = {}
-    client_fonts = {}
-    
-    # Primeiro busca na original para ter os estilos dos estáveis/reduzidos
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            cell = ws.cell(row=r, column=c)
-            v = cell.value
-            if v is not None:
-                norm_v = normalize_val(v)
-                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
-                    if cell.fill and cell.fill.patternType == 'solid':
-                        client_fills[norm_v] = copy(cell.fill)
-                    if cell.font:
-                        client_fonts[norm_v] = copy(cell.font)
-                        
-    # Depois busca na modificada para capturar os estilos gerados pelo LayoutEngine para novos clientes
-    for r in range(1, new_ws.max_row + 1):
-        for c in range(1, new_ws.max_column + 1):
-            cell = new_ws.cell(row=r, column=c)
-            v = cell.value
-            if v is not None:
-                norm_v = normalize_val(v)
-                if norm_v != "" and norm_v not in ('VAZIO', 'CT', 'SA', 'SALA', 'CW', '##'):
-                    if cell.fill and cell.fill.patternType == 'solid':
-                        client_fills[norm_v] = copy(cell.fill)
-                    if cell.font:
-                        client_fonts[norm_v] = copy(cell.font)
-
-    paleta_cores = ['34495E', '9B59B6', '1ABC9C', 'E67E22', '2ECC71', '3498DB', 'E74C3C']
-    default_new_fills = {}
-    default_new_fonts = {}
-    for idx, nc in enumerate(parametros_premissas["novos_clientes"]):
-        nome = nc["nome"]
-        if nome in ambientes_fisicos_falhos:
-            continue
-        cor_hex = paleta_cores[idx % len(paleta_cores)]
-        default_new_fills[nome] = PatternFill(start_color=cor_hex, end_color=cor_hex, fill_type='solid')
-        default_new_fonts[nome] = Font(color='FFFFFF', bold=True, size=8)
-
-    # 2. Determinar as metas esperadas (targets) de cada cliente
-    expected_targets = {}
-    orig_counts = {}
-    for r in range(1, ws.max_row + 1):
-        for c in range(1, ws.max_column + 1):
-            if (r, c) not in allowed_cells:
-                continue
-            val = ws.cell(row=r, column=c).value
-            if val is not None:
-                norm_val = normalize_val(val)
-                if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
-                    orig_counts[norm_val] = orig_counts.get(norm_val, 0) + 1
-                    
-    for client, qty in orig_counts.items():
-        if client in parametros_premissas["reducoes"]:
-            expected_targets[client] = qty - parametros_premissas["reducoes"][client]
-        else:
-            expected_targets[client] = qty
-        
-    # Mesas das salas internas pertencem ao cliente e entram no inventario.
-    for nc in parametros_premissas["novos_clientes"]:
-        nome = nc["nome"]
-        if nome in ambientes_fisicos_falhos:
-            continue
-        target_pas = nc["PAs"]
-        for amb in criar_ambientes_solicitados:
-            if amb.get("cliente_destinado") == nome:
-                target_pas += amb.get("sala_lugares", 0)
-        expected_targets[nome] = target_pas
-        
-    # 3. Mapear as coordenadas das novas salas com base na presença física do cliente destino
-    room_cells_by_client = {}
-    if criar_ambientes_solicitados:
-        import ScannerPremissas
-        ScannerPremissas._orange_context_cache = {}
-        macro_blocks_reconcile = scan_orange_context(dest_file, SHEET_NAME)
-        for amb in criar_ambientes_solicitados:
-            bloco_id = amb.get("bloco")
-            cliente_dest = amb.get("cliente_destinado")
-            
-            block_match = re.search(r'\d+', str(bloco_id))
-            if block_match:
-                block_idx = int(block_match.group())
-                if block_idx <= len(macro_blocks_reconcile):
-                    block = macro_blocks_reconcile[block_idx - 1]
-                    for env in block.get('ambientes', []):
-                        client_presence = sum(
-                            1 for coord in env['cells'] 
-                            if new_ws.cell(row=coord[0], column=coord[1]).value == cliente_dest
-                        )
-                        if client_presence > 0:
-                            room_cells_by_client.setdefault(cliente_dest, set()).update(env['cells'])
-
-    # 4. Obter contagem atual na planilha modificada
-    def get_actual_counts(sheet):
-        counts = {}
-        for r in range(1, sheet.max_row + 1):
-            for c in range(1, sheet.max_column + 1):
-                if (r, c) not in inventory_cells:
-                    continue
-                val = sheet.cell(row=r, column=c).value
-                if val is not None:
-                    norm_val = normalize_val(val)
-                    if norm_val != "" and norm_val not in ('VAZIO', 'CT', 'CATRACA', 'SA', 'SALA', 'CW', 'COWORKING', '##'):
-                        counts[norm_val] = counts.get(norm_val, 0) + 1
-        return counts
-
-    actual_counts = get_actual_counts(new_ws)
-    
-    # 5. Ajustar excessos (limpar duplicatas criadas fora das salas físicas oficiais)
-    for client, target in expected_targets.items():
-        actual = actual_counts.get(client, 0)
-        if actual > target:
-            diff = actual - target
-            client_cells = []
-            for r in range(1, new_ws.max_row + 1):
-                for c in range(1, new_ws.max_column + 1):
-                    if (r, c) not in allowed_cells:
-                        continue
-                    val = new_ws.cell(row=r, column=c).value
-                    if val is not None and normalize_val(val) == client:
-                        dedicated_cells = room_cells_by_client.get(client, set())
-                        if (r, c) not in dedicated_cells:
-                            client_cells.append((r, c))
-            
-            for r, c in sorted(client_cells, key=lambda x: (x[1], x[0]))[:diff]:
-                new_ws.cell(row=r, column=c).value = 'vazio'
-                new_ws.cell(row=r, column=c).fill = FILL_LIBERADO
-                new_ws.cell(row=r, column=c).font = FONT_SMALL
-            
-    # Re-computa contagens antes de suprir déficits
-    actual_counts = get_actual_counts(new_ws)
-    
-    # 6. Ajustar déficits (alocar assentos em vazios aplicando os estilos corretos preservados)
-    for client, target in expected_targets.items():
-        actual = actual_counts.get(client, 0)
-        if actual < target:
-            diff = target - actual
-            vazio_cells = []
-            for r in range(1, new_ws.max_row + 1):
-                for c in range(1, new_ws.max_column + 1):
-                    if (r, c) not in allowed_cells:
-                        continue
-                    val = new_ws.cell(row=r, column=c).value
-                    if (r, c) in salas_internas_cells:
-                        continue
-                    if val is None or normalize_val(val) in ('VAZIO', ''):
-                        vazio_cells.append((r, c))
-            
-            vazio_cells.sort(key=lambda x: (x[1], x[0]))
-            
-            fill_to_apply = client_fills.get(client) or default_new_fills.get(client, FILL_NEW_CLIENT)
-            font_to_apply = client_fonts.get(client) or default_new_fonts.get(client) or (FONT_WHITE if client.startswith("N_") else FONT_SMALL)
-            
-            for r, c in vazio_cells[:diff]:
-                new_ws.cell(row=r, column=c).value = client
-                new_ws.cell(row=r, column=c).fill = fill_to_apply
-                new_ws.cell(row=r, column=c).font = font_to_apply
-                
-    # Salva a planilha reconciliada final
+    inventory_cells, parametros_validacao = reconciliar_inventario(
+        ws=ws,
+        new_ws=new_ws,
+        allowed_cells=allowed_cells,
+        salas_internas_cells=salas_internas_cells,
+        parametros=parametros_premissas,
+        ambientes=criar_ambientes_solicitados,
+        ambientes_falhos=ambientes_fisicos_falhos,
+        dest_file=dest_file,
+        sheet_name=SHEET_NAME,
+    )
     new_wb.save(dest_file)
     print("⚖️ Inventário reconciliado com sucesso! Iniciando validação física...")
 
-    # Re-scan dos blocos e paredes laranjas (ScannerPremissas) para forçar o remapeamento dinâmico
     import ScannerPremissas
     ScannerPremissas._orange_context_cache = {}
-    
-    # Ajusta os parâmetros de validação para que desconsidere as mesas em branco das salas de reunião
-    adjusted_novos_clientes = []
-    for nc in parametros_premissas["novos_clientes"]:
-        nome = nc["nome"]
-        if nome in ambientes_fisicos_falhos:
-            continue
-        pas_originais = nc["PAs"]
-        # Soma os lugares das salas internas ao inventario do cliente.
-        for amb in criar_ambientes_solicitados:
-            if amb.get("cliente_destinado") == nome:
-                pas_originais += amb.get("sala_lugares", 0)
-        adjusted_novos_clientes.append({
-            "nome": nome,
-            "PAs": pas_originais
-        })
-        
-    parametros_validacao = {
-        "reducoes": parametros_premissas["reducoes"],
-        "novos_clientes": adjusted_novos_clientes
-    }
-    
     ambientes_criados_str = "\n".join(ambientes_criados_info) if ambientes_criados_info else "Nenhum ambiente físico criado nesta rodada."
     erros_validacao = validar_inventario(ws, new_ws, inventory_cells, parametros_validacao)
 

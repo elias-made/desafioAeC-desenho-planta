@@ -220,6 +220,19 @@ def get_interior_cells(border_cells: Set[Tuple[int, int]], max_row: int, max_col
                 interior.add(coord)
     return interior
 
+def _anotacoes_proximas(cells, all_cells_cache):
+    """Coleta anotacoes em raio Manhattan 2 ao redor de um conjunto de celulas."""
+    textos = set()
+    for r, c in cells:
+        for dr in range(-2, 3):
+            for dc in range(-2, 3):
+                if abs(dr) + abs(dc) > 2:
+                    continue
+                vizinha = all_cells_cache.get((r + dr, c + dc))
+                if vizinha and is_text_annotation(vizinha.value):
+                    textos.add(str(vizinha.value).strip())
+    return textos
+
 def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1) -> List[Dict]:
     global _orange_context_cache
     cache_key = os.path.abspath(file_path)
@@ -415,17 +428,7 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                 env_r_max = max(r for r, c in env_cells)
                 env_c_min = min(c for r, c in env_cells)
                 env_c_max = max(c for r, c in env_cells)
-                env_texts = set()
-                for (r, c) in env_cells:
-                    for dr in range(-2, 3):
-                        for dc in range(-2, 3):
-                            if abs(dr) + abs(dc) <= 2:
-                                nr, nc = r + dr, c + dc
-                                neighbor_cell = all_cells_cache.get((nr, nc))
-                                if neighbor_cell:
-                                    val = neighbor_cell.value
-                                    if is_text_annotation(val):
-                                        env_texts.add(str(val).strip())
+                env_texts = _anotacoes_proximas(env_cells, all_cells_cache)
                 ambientes.append({
                     'id': chr(64 + sub_idx),
                     'bounding_box': (env_r_min, env_r_max, env_c_min, env_c_max),
@@ -433,17 +436,7 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
                     'texts': sorted(list(env_texts))
                 })
         else:
-            env_texts = set()
-            for (r, c) in interior_cells:
-                for dr in range(-2, 3):
-                    for dc in range(-2, 3):
-                        if abs(dr) + abs(dc) <= 2:
-                            nr, nc = r + dr, c + dc
-                            neighbor_cell = all_cells_cache.get((nr, nc))
-                            if neighbor_cell:
-                                val = neighbor_cell.value
-                                if is_text_annotation(val):
-                                    env_texts.add(str(val).strip())
+            env_texts = _anotacoes_proximas(interior_cells, all_cells_cache)
             ambientes.append({
                 'id': "A",
                 'bounding_box': (r_min_macro, r_max_macro, c_min_macro, c_max_macro),
@@ -462,21 +455,3 @@ def scan_orange_context(file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII
             
     _orange_context_cache[cache_key] = macro_blocks
     return _orange_context_cache[cache_key]
-
-def build_context_string_for_llm(macro_blocks: List[Dict]) -> str:
-    if not macro_blocks:
-        return "Nenhum macro-bloco laranja encontrado."
-    linhas = ["=== PREMISSAS E CONTEXTO EXTRAÍDOS DAS BORDAS LARANJAS ==="]
-    for b in macro_blocks:
-        b_id = b['id']
-        linhas.append(f"\n{b_id}:")
-        if b['texts']:
-            linhas.append("  📌 Anotações na borda do bloco:")
-            for txt in b['texts']:
-                linhas.append(f"    - {txt}")
-        for env in b.get('ambientes', []):
-            if env.get('texts'):
-                linhas.append(f"  Ambiente {b_id}-{env['id']}:")
-                for txt in env['texts']:
-                    linhas.append(f"    - '{txt}'")
-    return "\n".join(linhas)

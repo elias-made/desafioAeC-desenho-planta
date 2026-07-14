@@ -1,11 +1,8 @@
-import os
 import re
+from collections import deque
 from typing import List, Set, Tuple
-import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.cell.cell import MergedCell
-
-from ScannerPremissas import scan_orange_context
 
 
 def _eh_celula_mesclada(ws, r: int, c: int) -> bool:
@@ -225,46 +222,46 @@ def _celulas_contorno_do_ambiente(ws, env_cells: Set[Tuple[int, int]]) -> Set[Tu
                 
     return extra
 
-def _verificar_acessibilidade_mesas(
-    ws, 
-    env_cells: Set[Tuple[int, int]], 
-    room_cells: Set[Tuple[int, int]], 
-    desk_cells: Set[Tuple[int, int]]
-) -> Tuple[bool, Set[Tuple[int, int]]]:
-    """Verifica se todas as mesas têm ao menos um caminho de corredor até a saída do ambiente."""
+def _corredores_alcancaveis_da_saida(ws, room_cells, desk_cells):
+    """Calcula corredores conectados a alguma saida sem atravessar paredes."""
     from collections import deque
-    
+
     corridor_cells = room_cells - desk_cells
-    
-    exit_cells: Set[Tuple[int, int]] = set()
-    for (r, c) in corridor_cells:
+    exit_cells = set()
+    for r, c in corridor_cells:
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nr, nc = r + dr, c + dc
-            if (nr, nc) not in room_cells:
-                if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
-                    exit_cells.add((r, c))
-                    break
-    
-    if not exit_cells:
-        return False, set(desk_cells)
-    
-    alcancaveis: Set[Tuple[int, int]] = set()
+            if (nr, nc) not in room_cells and not _tem_parede_laranja_entre(ws, r, c, nr, nc):
+                exit_cells.add((r, c))
+                break
+
+    alcancaveis = set(exit_cells)
     fila = deque(exit_cells)
-    alcancaveis.update(exit_cells)
-    
     while fila:
         r, c = fila.popleft()
         for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr, nc = r + dr, c + dc
-            if (nr, nc) in alcancaveis:
+            vizinho = (r + dr, c + dc)
+            if vizinho in alcancaveis or vizinho not in corridor_cells:
                 continue
-            if (nr, nc) not in corridor_cells:
+            if _tem_parede_laranja_entre(ws, r, c, vizinho[0], vizinho[1]):
                 continue
-            if _tem_parede_laranja_entre(ws, r, c, nr, nc):
-                continue
-            alcancaveis.add((nr, nc))
-            fila.append((nr, nc))
-    
+            alcancaveis.add(vizinho)
+            fila.append(vizinho)
+    return corridor_cells, exit_cells, alcancaveis
+
+def _verificar_acessibilidade_mesas(
+    ws,
+    env_cells: Set[Tuple[int, int]],
+    room_cells: Set[Tuple[int, int]],
+    desk_cells: Set[Tuple[int, int]]
+) -> Tuple[bool, Set[Tuple[int, int]]]:
+    """Verifica se todas as mesas têm ao menos um caminho de corredor até a saída do ambiente."""
+    corridor_cells, exit_cells, alcancaveis = _corredores_alcancaveis_da_saida(
+        ws, room_cells, desk_cells
+    )
+    if not exit_cells:
+        return False, set(desk_cells)
+
     mesas_sem_saida: Set[Tuple[int, int]] = set()
     for (r, c) in desk_cells:
         tem_acesso = False
@@ -290,35 +287,10 @@ def _expandir_corredor_para_acessibilidade(
     
     IMPORTANTE: Respeita divisórias desenhadas anteriormente (células com valor "N_" ou bordas laranjas).
     """
-    from collections import deque
-    
-    corridor_cells = room_cells - desk_cells
-    
-    exit_cells: Set[Tuple[int, int]] = set()
-    for (r, c) in corridor_cells:
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr, nc = r + dr, c + dc
-            if (nr, nc) not in room_cells:
-                if not _tem_parede_laranja_entre(ws, r, c, nr, nc):
-                    exit_cells.add((r, c))
-                    break
-    
-    alcancaveis: Set[Tuple[int, int]] = set()
-    fila = deque(exit_cells)
-    alcancaveis.update(exit_cells)
-    while fila:
-        r, c = fila.popleft()
-        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nr, nc = r + dr, c + dc
-            if (nr, nc) in alcancaveis:
-                continue
-            if (nr, nc) not in corridor_cells:
-                continue
-            if _tem_parede_laranja_entre(ws, r, c, nr, nc):
-                continue
-            alcancaveis.add((nr, nc))
-            fila.append((nr, nc))
-    
+    _, _, alcancaveis = _corredores_alcancaveis_da_saida(
+        ws, room_cells, desk_cells
+    )
+
     novos_corredores: Set[Tuple[int, int]] = set()
     
     for (mr, mc) in mesas_sem_saida:
@@ -486,12 +458,6 @@ def get_env_cells(block_id_str: str, env_letter: str, macro_blocks: List[dict]) 
 # ══════════════════════════════════════════════════════════════════════════
 # Geração de Layout de Sala Estruturada com Circulação Interna Própria
 # ══════════════════════════════════════════════════════════════════════════
-
-def _calcular_altura_sala(W: int, N: int) -> int:
-    desks_per_row = 4 if W == 5 else 2
-    h_desks = (N + desks_per_row - 1) // desks_per_row
-    h_corridors = (h_desks - 1) // 3 if h_desks > 3 else 0
-    return h_desks + h_corridors
 
 def _eh_celula_valida_para_sala(ws, r: int, c: int, env_cells: Set[Tuple[int, int]]) -> bool:
     """Verifica se a célula está dentro do bloco, evitando pilares e outras salas."""
@@ -797,8 +763,8 @@ def _gerar_layout_sala_estruturado(
 # ══════════════════════════════════════════════════════════════════════════
 
 def separar_ambiente_e_desenhar_divisorias(
-    ws, 
-    env_cells: Set[Tuple[int, int]], 
+    ws,
+    env_cells: Set[Tuple[int, int]],
     allocated_cells: Set[Tuple[int, int]], 
     border_style: str = "medium", 
     border_color: str = "FF9900",
@@ -1551,267 +1517,3 @@ def _selecionar_mesas_contiguas(env_cells: Set[Tuple[int, int]], ws, target_qty:
         selected_list = list(selected_set)
                 
     return set(selected_list)
-
-
-def gerar_alternativas_mesas(
-    env_cells: Set[Tuple[int, int]], 
-    ws, 
-    target_qty: int, 
-    max_alternativas: int = 5
-) -> List[Set[Tuple[int, int]]]:
-    """
-    Gera múltiplas alternativas de seleção de mesas, priorizando regiões compactas e retangulares.
-    
-    REGRA CRÍTICA: Só seleciona mesas de bancadas que são FISICAMENTE CONTÍGUAS (adjacentes),
-    sem células de outros clientes entre elas.
-    """
-    from BlockMapper import flood_fill
-    
-    # Coleta todas as mesas válidas (excluindo células de outros clientes)
-    all_desks = set()
-    for r, c in env_cells:
-        cell = ws.cell(row=r, column=c)
-        val = str(cell.value).strip().upper() if cell.value else ""
-        if val.startswith("N_"):
-            continue
-        if _eh_celula_de_mesa_local(cell):
-            all_desks.add((r, c))
-    
-    if not all_desks:
-        return []
-    
-    # Agrupa mesas em bancadas contíguas
-    benches = flood_fill(all_desks)
-    if not benches:
-        return []
-    
-    alternativas = []
-    
-    # Ordena bancadas por tamanho (maior primeiro)
-    benches_sorted = sorted(benches, key=lambda b: len(b), reverse=True)
-    
-    # ESTRATÉGIA 1: Tenta usar UMA ÚNICA bancada grande
-    for bench in benches_sorted:
-        bench_set = set(bench)
-        if len(bench_set) >= target_qty:
-            # Gera alternativa pegando do topo da bancada
-            b_rows = sorted(list({r for r, c in bench_set}))
-            b_cols = sorted(list({c for r, c in bench_set}))
-            is_vertical = len(b_rows) >= len(b_cols)
-            
-            selected = set()
-            if is_vertical:
-                # Pega linhas do topo para baixo
-                for row in b_rows:
-                    cells_in_row = sorted([(r, c) for r, c in bench_set if r == row], key=lambda x: x[1])
-                    for cell in cells_in_row:
-                        if len(selected) >= target_qty:
-                            break
-                        selected.add(cell)
-                    if len(selected) >= target_qty:
-                        break
-            else:
-                # Pega colunas da esquerda para direita
-                for col in b_cols:
-                    cells_in_col = sorted([(r, c) for r, c in bench_set if c == col], key=lambda x: x[0])
-                    for cell in cells_in_col:
-                        if len(selected) >= target_qty:
-                            break
-                        selected.add(cell)
-                    if len(selected) >= target_qty:
-                        break
-            
-            if len(selected) >= target_qty:
-                rs = [r for r, c in selected]
-                cs = [c for r, c in selected]
-                bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1)
-                alternativas.append((bbox_area, len(selected), selected))
-    
-    # ESTRATÉGIA 2: Combina APENAS bancadas adjacentes (distância 1, sem obstáculos entre elas)
-    if not alternativas or all(len(alt[2]) < target_qty for alt in alternativas):
-        n_benches = len(benches)
-        
-        # Para cada bancada, encontra bancadas DIRETAMENTE adjacentes
-        adjacency = {i: set() for i in range(n_benches)}
-        
-        for i in range(n_benches):
-            for j in range(i + 1, n_benches):
-                # Verifica se há célula de bench_i adjacente a célula de bench_j
-                adjacent = False
-                for r1, c1 in benches[i]:
-                    if adjacent:
-                        break
-                    for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                        nr, nc = r1 + dr, c1 + dc
-                        if (nr, nc) in set(benches[j]):
-                            adjacent = True
-                            break
-                        # Também aceita se há apenas 1 célula de corredor livre entre elas
-                        if (nr, nc) in env_cells and (nr, nc) not in all_desks:
-                            cell_between = ws.cell(row=nr, column=nc)
-                            val_between = str(cell_between.value).strip().upper() if cell_between.value else ""
-                            # Célula entre deve ser corredor vazio, não outro cliente
-                            if not val_between.startswith("N_") and not _eh_celula_de_mesa_local(cell_between):
-                                for dr2, dc2 in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-                                    if (nr + dr2, nc + dc2) in set(benches[j]):
-                                        adjacent = True
-                                        break
-                        if adjacent:
-                            break
-                
-                if adjacent:
-                    adjacency[i].add(j)
-                    adjacency[j].add(i)
-        
-        # BFS para encontrar grupos de bancadas conectadas
-        visited = set()
-        grupos_conectados = []
-        
-        for start in range(n_benches):
-            if start in visited:
-                continue
-            grupo = []
-            fila = [start]
-            while fila:
-                curr = fila.pop(0)
-                if curr in visited:
-                    continue
-                visited.add(curr)
-                grupo.append(curr)
-                for adj in adjacency[curr]:
-                    if adj not in visited:
-                        fila.append(adj)
-            if grupo:
-                grupos_conectados.append(grupo)
-        
-        # Para cada grupo conectado, gera alternativa
-        for grupo in grupos_conectados:
-            grupo_benches = [benches[i] for i in grupo]
-            total_cap = sum(len(b) for b in grupo_benches)
-            
-            if total_cap < target_qty:
-                continue
-            
-            # Ordena bancadas do grupo por posição (top-left first)
-            grupo_benches_sorted = sorted(grupo_benches, key=lambda b: (min(r for r, c in b), min(c for r, c in b)))
-            
-            selected = set()
-            for bench in grupo_benches_sorted:
-                bench_list = sorted(list(bench), key=lambda x: (x[0], x[1]))
-                for cell in bench_list:
-                    if len(selected) >= target_qty:
-                        break
-                    selected.add(cell)
-                if len(selected) >= target_qty:
-                    break
-            
-            if len(selected) >= target_qty:
-                rs = [r for r, c in selected]
-                cs = [c for r, c in selected]
-                bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1)
-                alternativas.append((bbox_area, len(selected), selected))
-    
-    # Fallback: usa a seleção original
-    if not alternativas:
-        original = _selecionar_mesas_contiguas(env_cells, ws, target_qty)
-        if original:
-            rs = [r for r, c in original]
-            cs = [c for r, c in original]
-            bbox_area = (max(rs) - min(rs) + 1) * (max(cs) - min(cs) + 1) if original else float('inf')
-            alternativas.append((bbox_area, len(original), original))
-    
-    # Ordena por compacidade (menor bbox_area primeiro)
-    alternativas.sort(key=lambda x: (x[0], -x[1]))
-    
-    # Remove duplicatas
-    seen = set()
-    resultado = []
-    for _, _, selected in alternativas:
-        key = frozenset(selected)
-        if key not in seen:
-            seen.add(key)
-            resultado.append(selected)
-            if len(resultado) >= max_alternativas:
-                break
-    
-    return resultado
-
-
-def testar_criacao_sala_manual(
-    file_path: str,
-    sheet_name: str,
-    bloco_id: str,
-    ambiente_letra: str,
-    quantidade_mesas: int,
-    quantidade_mesas_sala: int = None,
-    output_path: str = "planta_teste_sala.xlsx",
-    border_style: str = "medium",
-    border_color: str = "FF9900"
-):
-    print(f"\n[INICIANDO TESTE MANUAL] Bloco: {bloco_id} | Ambiente: {ambiente_letra} | PAs Solicitadas: {quantidade_mesas}")
-    
-    if not os.path.exists(file_path):
-        print(f"Erro: Arquivo '{file_path}' não encontrado.")
-        return
-
-    wb = openpyxl.load_workbook(file_path)
-    ws = wb[sheet_name]
-
-    macro_blocks = scan_orange_context(file_path, sheet_name)
-    raw_env_cells = get_env_cells(bloco_id, ambiente_letra, macro_blocks)
-
-    if not raw_env_cells:
-        print(f"Erro: Não foi possível localizar células para o ambiente '{bloco_id}-{ambiente_letra}'.")
-        return
-
-    env_cells = set(raw_env_cells) | _celulas_contorno_do_ambiente(ws, set(raw_env_cells))
-
-    allocated_sala = set()
-    room_cells_override = None
-    
-    if quantidade_mesas_sala is not None:
-        print(f"🛠️ Planejando Sala Fechada de {quantidade_mesas_sala} mesas...")
-        allocated_sala, room_cells_override = _gerar_layout_sala_estruturado(ws, env_cells, quantidade_mesas_sala)
-
-    available_env_cells = env_cells - (room_cells_override if room_cells_override else set())
-    allocated_ambiente = _selecionar_mesas_contiguas(available_env_cells, ws, quantidade_mesas)
-    
-    if not allocated_ambiente:
-        print("Erro: Nenhuma mesa utilizável encontrada nesse ambiente para a equipe principal.")
-        return
-
-    allocated_total = allocated_ambiente | (room_cells_override if room_cells_override else set())
-    separar_ambiente_e_desenhar_divisorias(
-        ws=ws, 
-        env_cells=env_cells, 
-        allocated_cells=allocated_total,
-        border_style=border_style, 
-        border_color=border_color,
-        reconstruir_sala=False,
-        room_cells_override=room_cells_override
-    )
-
-    if quantidade_mesas_sala is not None:
-        separar_ambiente_e_desenhar_divisorias(
-            ws=ws, 
-            env_cells=env_cells, 
-            allocated_cells=allocated_sala,
-            border_style=border_style, 
-            border_color=border_color,
-            reconstruir_sala=True,
-            room_cells_override=room_cells_override
-        )
-
-    wb.save(output_path)
-    print(f"✓ Teste concluído com sucesso! Resultado salvo em: '{output_path}'")
-
-if __name__ == "__main__":
-    testar_criacao_sala_manual(
-        file_path="planta.xlsx",
-        sheet_name="JPIII",
-        bloco_id="Bloco_7",
-        ambiente_letra="A",         
-        quantidade_mesas=165, 
-        quantidade_mesas_sala=1,
-        output_path="planta_teste_sala.xlsx"
-    )
