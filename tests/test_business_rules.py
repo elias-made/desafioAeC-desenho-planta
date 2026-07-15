@@ -8,7 +8,10 @@ from CapacityValidator import avaliar_capacidade
 from PremiseNormalizer import normalizar_nomes_novos_por_ordem, normalizar_quantidades_ambientes
 from InventoryReconciler import reconciliar_inventario
 from AmbienteBuilder import _corredores_alcancaveis_da_saida, _gerar_layout_sala_estruturado
-from ScannerPremissas import invalidate_orange_cache, scan_orange_context
+from ScannerPremissas import (
+    invalidate_orange_cache, scan_orange_context, is_desk_cell,
+    _deduplicar_macro_blocos_aninhados,
+)
 from Agents import OrganizadorDeps
 
 
@@ -61,6 +64,27 @@ class AgentContractTests(unittest.TestCase):
         self.assertEqual(deps.ambientes_criados, "ambientes")
 
 class ScannerCacheTests(unittest.TestCase):
+    def test_contorno_duplo_com_as_mesmas_mesas_vira_um_so_bloco(self):
+        ws = Workbook().active
+        ws.cell(3, 3).value = 8
+        cache = {(3, 3): ws.cell(3, 3)}
+        externo = {
+            'id': 'Macro_Bloco_1', 'bounding_box': (1, 5, 1, 5),
+            'interior_cells': {(2, 2), (3, 3), (4, 4)},
+        }
+        interno = {
+            'id': 'Macro_Bloco_2', 'bounding_box': (2, 4, 2, 4),
+            'interior_cells': {(3, 3)},
+        }
+        resultado = _deduplicar_macro_blocos_aninhados([externo, interno], cache)
+        self.assertEqual(resultado, [externo])
+        self.assertEqual(resultado[0]['id'], 'Macro_Bloco_1')
+
+    def test_cliente_numerico_com_dois_digitos_e_mesa(self):
+        ws = Workbook().active
+        ws.cell(1, 1).value = 10
+        self.assertTrue(is_desk_cell(ws.cell(1, 1)))
+
     def test_scanner_em_memoria_nao_reabre_arquivo_e_respeita_invalidacao(self):
         ws = Workbook().active
         ws.cell(3, 3).value = ""

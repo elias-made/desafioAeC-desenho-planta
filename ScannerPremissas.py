@@ -149,11 +149,11 @@ def is_desk_cell(cell) -> bool:
     if val_upper in ('##', 'SALA', 'COWORKING', 'SALA CLIENTE', 'SALA1', 'SALA2', 'SALA3', 'SALA4', 'CATRACA', 'CT', 'ESCANINHOS'):
         return False
         
-    # Valores numéricos > 9 são anotações de capacidade, não assentos individuais
+    # Identificadores numericos tambem podem ter dois ou mais digitos
+    # (por exemplo, o cliente 10). O fato de ser maior que 9 nao transforma
+    # automaticamente a celula em anotacao de capacidade.
     try:
-        val_num = float(val_upper)
-        if val_num > 9:
-            return False
+        float(val_upper)
         return True
     except ValueError:
         pass
@@ -248,6 +248,36 @@ def _anotacoes_proximas(cells, all_cells_cache):
                 if vizinha and is_text_annotation(vizinha.value):
                     textos.add(str(vizinha.value).strip())
     return textos
+
+def _deduplicar_macro_blocos_aninhados(macro_blocks, all_cells_cache):
+    '''Mantem o contorno externo quando aneis aninhados cercam as mesmas mesas.'''
+    mesas_por_indice = []
+    for bloco in macro_blocks:
+        mesas_por_indice.append({
+            coord for coord in bloco.get('interior_cells', set())
+            if is_desk_cell(all_cells_cache.get(coord))
+        })
+
+    manter = []
+    for indice, bloco in enumerate(macro_blocks):
+        r0, r1, c0, c1 = bloco['bounding_box']
+        duplicado_interno = False
+        for outro_indice, outro in enumerate(macro_blocks):
+            if indice == outro_indice or not mesas_por_indice[indice]:
+                continue
+            or0, or1, oc0, oc1 = outro['bounding_box']
+            contem = or0 <= r0 and or1 >= r1 and oc0 <= c0 and oc1 >= c1
+            estrito = (or0, or1, oc0, oc1) != (r0, r1, c0, c1)
+            mesmas_mesas = mesas_por_indice[outro_indice] == mesas_por_indice[indice]
+            if contem and estrito and mesmas_mesas:
+                duplicado_interno = True
+                break
+        if not duplicado_interno:
+            manter.append(bloco)
+
+    for indice, bloco in enumerate(manter, start=1):
+        bloco['id'] = f'Macro_Bloco_{indice}'
+    return manter
 
 def scan_orange_context(
     file_path: str = 'planta.xlsx', sheet_name: str = 'JPIII', max_gap: int = 1,
@@ -481,6 +511,7 @@ def scan_orange_context(
         })
         idx_counter += 1
             
+    macro_blocks = _deduplicar_macro_blocos_aninhados(macro_blocks, all_cells_cache)
     _orange_context_cache[cache_key] = macro_blocks
     if workbook_carregado is not None:
         workbook_carregado.close()
