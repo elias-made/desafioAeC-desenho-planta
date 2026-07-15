@@ -110,6 +110,13 @@ Audite sem presumir sucesso ou falha:
 7. DIVISAO: enumere TODOS os clientes/equipes, inclusive nomes nao numericos. Se o mapa nao localizar todo o inventario, marque como inconclusivo.
 8. PRESERVACAO: diferencie inventario global de preservacao de salas e geometria.
 
+== REGRAS DE MOVIMENTAÇÕES ==
+1. Veja que grande parte dos clientes esta isolada em seus ambientes. Voce DEVE PRIORIZAR esse isolamento para TODOS os clientes, novos e existentes, a menos que a premissa autorize explicitamente a mistura.
+2. Audite todos os ambientes em busca de dois ou mais clientes ocupando o mesmo ambiente. Nao limite essa verificacao aos clientes que ja seriam movimentados por outro motivo.
+3. A permissao para os clientes 1, 3 e 4 ocuparem mais de dois ambientes NAO autoriza mistura entre clientes dentro do mesmo ambiente. Quantidade de ambientes ocupados e compartilhamento de um ambiente sao regras diferentes.
+4. Quando houver PAs de um cliente em ambiente predominantemente ocupado por outro e houver posicoes vazio em ambiente do primeiro cliente, voce DEVE propor uma transferencia de quantidades iguais entre o cliente e vazio para reduzir ou eliminar a mistura sem alterar o inventario.
+5. Se os vazios permitirem apenas uma correcao parcial, execute a maior transferencia segura possivel e registre como violacao a mistura restante. Antes de retornar acoes_organizacao vazia, comprove que procurou essas oportunidades em todos os blocos.
+
 == DIRETRIZES DE ATUACAO ==
 1. Use somente `transferir` nas correcoes executaveis; nunca crie ou apague inventario.
 2. Reconheca lacunas do mapa: ausencia de evidencia significa `inconclusivo`, nao `conforme`.

@@ -1,9 +1,7 @@
-Eliminar 300 posições cliente 1
+Eliminar 270 posições cliente 1
 Criar um novo espaço apartado com 124 PAs +1 sala com 4 lugares ( dentro do espaço)
 Criar um novo espaço apartado com 165 PAs +1 sala com 1 lugares ( dentro do espaço)
 Para todas as movimentações preservar a quantidade de posições e salas
 Não utilizar as salas 1,2,3,4 e coworking
 Os clientes não devem ficar divididos em mais de 2 ambientes com exceção dos clientes 1, 3,4
 1 catraca a cada 250 PAS
-Criar um novo espaço apartado no primeiro bloco com 20 novos PAs
-Criar um novo espaço apartado com 70 PAs no mesmo bloco do cliente com 124 PAs
