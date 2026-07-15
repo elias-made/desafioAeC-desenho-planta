@@ -511,6 +511,7 @@ def _classificar_celulas_sala(ws, env_cells: Set[Tuple[int, int]]):
 def _encontrar_melulo_retangulo_sala(
     ws, env_cells: Set[Tuple[int, int]], W: int, H: int, precomp=None,
     anchor_cells: Set[Tuple[int, int]] = None,
+    connection_offsets=None,
 ) -> Tuple[int, int, Set[Tuple[int, int]]]:
     """Encontra o melhor retângulo W x H para a sala fechada, priorizando o corredor de ligação."""
     if not env_cells:
@@ -594,6 +595,21 @@ def _encontrar_melulo_retangulo_sala(
                     break
             if not valido:
                 continue
+
+            # A circulacao interna precisa terminar diretamente em um
+            # corredor externo livre.
+            if connection_offsets:
+                conectado_ao_corredor = False
+                for rel_r, rel_c, dr, dc in connection_offsets:
+                    ir, ic = r_start + rel_r, c_start + rel_c
+                    er, ec = ir + dr, ic + dc
+                    if (er, ec) not in corridor_cells or (er, ec) in rect_cells:
+                        continue
+                    if not _tem_parede_laranja_entre(ws, ir, ic, er, ec):
+                        conectado_ao_corredor = True
+                        break
+                if not conectado_ao_corredor:
+                    continue
 
             touching_sides = 0
             if any((r_start - 1, c) not in valid_cells for c in range(c_start, c_end + 1)):
@@ -701,34 +717,56 @@ def _gerar_layout_sala_estruturado(
     if N <= 0:
         return set(), set()
 
-    import math
-
     precomp = _classificar_celulas_sala(ws, env_cells)
 
-    def _dims(orient, L):
-        prof = (N + 2 * L - 1) // (2 * L)
+    def _dims(orient, faixas):
+        # Cada faixa usa o modulo mesa-corredor-mesa. Assim todas as mesas
+        # ficam adjacentes a um corredor e nenhum corredor perimetral extra
+        # precisa ser reservado. Para uma unica mesa, basta mesa + corredor.
+        if N == 1:
+            return (2, 1, 1) if orient == 'v' else (1, 2, 1)
+        profundidade = (N + 2 * faixas - 1) // (2 * faixas)
         if orient == 'v':
-            return 3 * L + 1, prof + 1, prof
-        return prof + 1, 3 * L + 1, prof
+            return 3 * faixas, profundidade, profundidade
+        return profundidade, 3 * faixas, profundidade
 
-    L0 = max(1, int(round(math.sqrt(N / 6.0))))
-    Ls = sorted({l for l in range(max(1, L0 - 2), L0 + 3)} | {1})
+    # Avalia todas as quantidades de faixas pela area fisica consumida.
+    # O formato mais compacto e a proximidade da ancora sao desempates;
+    # portanto, o primeiro formato viavel e o de menor numero de celulas.
+    especificacoes = []
+    max_faixas = max(1, (N + 1) // 2)
+    for orient in ('v', 'h'):
+        for faixas in range(1, max_faixas + 1):
+            W, H, prof = _dims(orient, faixas)
+            if 2 * faixas * prof < N:
+                continue
+            if N == 1:
+                if orient == 'v':
+                    conexoes = [(0, 1, -1, 0), (0, 1, 1, 0), (0, 1, 0, 1)]
+                else:
+                    conexoes = [(1, 0, 0, -1), (1, 0, 0, 1), (1, 0, 1, 0)]
+            elif orient == 'v':
+                conexoes = []
+                for faixa in range(faixas):
+                    corredor_c = 3 * faixa + 1
+                    conexoes.extend(((0, corredor_c, -1, 0), (H - 1, corredor_c, 1, 0)))
+            else:
+                conexoes = []
+                for faixa in range(faixas):
+                    corredor_r = 3 * faixa + 1
+                    conexoes.extend(((corredor_r, 0, 0, -1), (corredor_r, W - 1, 0, 1)))
+            chave = (W * H, max(W, H), abs(W - H), orient, faixas)
+            especificacoes.append((chave, orient, faixas, W, H, prof, conexoes))
 
     melhor = None
-    for orient in ('v', 'h'):
-        for L in Ls:
-            W, H, prof = _dims(orient, L)
-            if 2 * L * prof < N:
-                continue
-            r, c, _rect = _encontrar_melulo_retangulo_sala(
-                ws, env_cells, W, H, precomp=precomp, anchor_cells=anchor_cells
-            )
-            if r is None:
-                continue
-            chave = (max(W, H), W * H)
-            cand = (chave, orient, L, r, c, W, H, prof)
-            if melhor is None or cand[0] < melhor[0]:
-                melhor = cand
+    for chave, orient, faixas, W, H, prof, conexoes in sorted(especificacoes):
+        r, c, _rect = _encontrar_melulo_retangulo_sala(
+            ws, env_cells, W, H, precomp=precomp, anchor_cells=anchor_cells,
+            connection_offsets=conexoes,
+        )
+        if r is not None:
+            melhor = (chave, orient, faixas, r, c, W, H, prof)
+            break
 
     if melhor is not None:
         _chave, orient, L, r_start, c_start, W, H, prof = melhor
@@ -739,14 +777,14 @@ def _gerar_layout_sala_estruturado(
         placed = 0
         if orient == 'v':
             for i in range(L):
-                dc1, dc2 = c_start + 3 * i + 1, c_start + 3 * i + 2
+                dc1, dc2 = c_start + 3 * i, c_start + 3 * i + 2
                 for r in range(r_start, r_start + prof):
                     for dc in (dc1, dc2):
                         if placed < N:
                             desks_set.add((r, dc)); placed += 1
         else:
             for i in range(L):
-                dr1, dr2 = r_start + 3 * i + 1, r_start + 3 * i + 2
+                dr1, dr2 = r_start + 3 * i, r_start + 3 * i + 2
                 for c in range(c_start, c_start + prof):
                     for dr in (dr1, dr2):
                         if placed < N:
@@ -755,8 +793,8 @@ def _gerar_layout_sala_estruturado(
         if placed >= N:
             return desks_set, room_all_cells
 
-    allocated = _gerar_bancadas_dinamicas(ws, env_cells, N)
-    return allocated, allocated
+    # Nao crie uma sala desconectada apenas para satisfazer a quantidade.
+    return set(), set()
 
 # ══════════════════════════════════════════════════════════════════════════
 # Funções de Desenho, Limpeza e Formatação

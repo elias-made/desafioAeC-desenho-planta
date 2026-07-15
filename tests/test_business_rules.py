@@ -7,17 +7,17 @@ from openpyxl import Workbook
 from CapacityValidator import avaliar_capacidade
 from PremiseNormalizer import normalizar_nomes_novos_por_ordem, normalizar_quantidades_ambientes
 from InventoryReconciler import reconciliar_inventario
-from AmbienteBuilder import _corredores_alcancaveis_da_saida
+from AmbienteBuilder import _corredores_alcancaveis_da_saida, _gerar_layout_sala_estruturado
 from ScannerPremissas import invalidate_orange_cache, scan_orange_context
 from Agents import OrganizadorDeps
 
 
 class PremiseNormalizerTests(unittest.TestCase):
     def test_ordem_do_txt_prevalece_sobre_nomes_da_llm(self):
-        premissas = """Criar espaço com 124 PAs + sala com 4 lugares
-Criar espaço com 165 PAs + sala com 1 lugar
-Criar espaço no primeiro bloco com 20 novos PAs
-Criar espaço com 70 PAs no mesmo bloco do cliente com 124 PAs"""
+        premissas = """Criar espaÃƒÂ§o com 124 PAs + sala com 4 lugares
+Criar espaÃƒÂ§o com 165 PAs + sala com 1 lugar
+Criar espaÃƒÂ§o no primeiro bloco com 20 novos PAs
+Criar espaÃƒÂ§o com 70 PAs no mesmo bloco do cliente com 124 PAs"""
         data = {
             "gabarito": {"novos_clientes": [
                 {"nome": "N_1"}, {"nome": "N_2"}, {"nome": "N_3"}, {"nome": "N_4"}
@@ -74,6 +74,41 @@ class ScannerCacheTests(unittest.TestCase):
         self.assertIsNot(primeiro, terceiro)
 
 class GeometryUtilityTests(unittest.TestCase):
+    def _area_livre(self, tamanho=12):
+        ws = Workbook().active
+        ws.cell(tamanho, tamanho)
+        env = {(r, c) for r in range(1, tamanho + 1) for c in range(1, tamanho + 1)}
+        return ws, env
+
+    def test_sala_de_um_lugar_usa_apenas_mesa_e_corredor(self):
+        ws, env = self._area_livre()
+        mesas, sala = _gerar_layout_sala_estruturado(ws, env, 1)
+        self.assertEqual(len(mesas), 1)
+        self.assertEqual(len(sala), 2)
+        self.assertTrue(mesas <= sala)
+
+    def test_sala_de_quatro_lugares_usa_modulo_mesa_corredor_mesa(self):
+        ws, env = self._area_livre()
+        mesas, sala = _gerar_layout_sala_estruturado(ws, env, 4)
+        corredores = sala - mesas
+        self.assertEqual(len(mesas), 4)
+        self.assertEqual(len(sala), 6)
+        self.assertEqual(len(corredores), 2)
+        for r, c in mesas:
+            self.assertTrue(
+                any((r + dr, c + dc) in corredores for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)))
+            )
+
+    def test_corredor_interno_da_sala_encontra_corredor_externo(self):
+        ws, env = self._area_livre()
+        mesas, sala = _gerar_layout_sala_estruturado(ws, env, 4)
+        corredores_internos = sala - mesas
+        self.assertTrue(any(
+            (r + dr, c + dc) in env - sala
+            for r, c in corredores_internos
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1))
+        ))
+
     def test_corredores_internos_alcancam_a_saida(self):
         ws = Workbook().active
         ws.cell(6, 6).value = ""  # dimensao externa ao ambiente do teste

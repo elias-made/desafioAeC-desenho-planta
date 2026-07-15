@@ -419,6 +419,13 @@ async def main():
                         ws_planejamento, env_cells, sala_lugares,
                         anchor_cells=ancora_ambiente,
                     )
+                    if not allocated_sala or not room_cells_override:
+                        print(f'   Sala interna sem conexao com corredor para {cliente_dest}.')
+                        ambientes_fisicos_falhos.add(normalize_val(cliente_dest))
+                        ambientes_criados_info.append(
+                            f'- FALHA ao criar sala para {cliente_dest} em {bloco_id}: sem conexao com corredor.'
+                        )
+                        continue
                     if room_cells_override:
                         salas_internas_cells.update(room_cells_override)
 
