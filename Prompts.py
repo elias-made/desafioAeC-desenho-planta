@@ -111,11 +111,12 @@ Audite sem presumir sucesso ou falha:
 8. PRESERVACAO: diferencie inventario global de preservacao de salas e geometria.
 
 == REGRAS DE MOVIMENTAÇÕES ==
-1. Veja que grande parte dos clientes esta isolada em seus ambientes. Voce DEVE PRIORIZAR esse isolamento para TODOS os clientes, novos e existentes, a menos que a premissa autorize explicitamente a mistura.
+1. Primeiro cumpra as premissas explicitas. Depois, se houver mais de uma solucao equivalente, priorize o isolamento de todos os clientes. Uma mistura explicitamente solicitada pela premissa e autorizada e nao deve ser corrigida.
 2. Audite todos os ambientes em busca de dois ou mais clientes ocupando o mesmo ambiente. Nao limite essa verificacao aos clientes que ja seriam movimentados por outro motivo.
 3. A permissao para os clientes 1, 3 e 4 ocuparem mais de dois ambientes NAO autoriza mistura entre clientes dentro do mesmo ambiente. Quantidade de ambientes ocupados e compartilhamento de um ambiente sao regras diferentes.
-4. Quando houver PAs de um cliente em ambiente predominantemente ocupado por outro e houver posicoes vazio em ambiente do primeiro cliente, voce DEVE propor uma transferencia de quantidades iguais entre o cliente e vazio para reduzir ou eliminar a mistura sem alterar o inventario.
-5. Se os vazios permitirem apenas uma correcao parcial, execute a maior transferencia segura possivel e registre como violacao a mistura restante. Antes de retornar acoes_organizacao vazia, comprove que procurou essas oportunidades em todos os blocos.
+4. Uma transferencia de isolamento so deve ser executada quando atender diretamente a uma premissa explicita OU eliminar completamente uma mistura nao autorizada sem criar outra violacao.
+5. NAO execute correcoes apenas parciais de isolamento, salvo quando a premissa pedir explicitamente uma reducao parcial. Se nao houver capacidade para eliminar toda a mistura, registre a violacao e mantenha o layout sem essa movimentacao.
+6. Entre todas as solucoes que atendem as premissas, escolha nesta ordem: (a) a que nao cria novas violacoes; (b) a que movimenta menos PAs; (c) a que usa menos acoes; (d) a que preserva mais posicoes `vazio` em ambientes exclusivos dos respectivos clientes. Uma melhoria estetica ou parcial de isolamento nao justifica movimentacoes adicionais.
 
 == DIRETRIZES DE ATUACAO ==
 1. Use somente `transferir` nas correcoes executaveis; nunca crie ou apague inventario.
