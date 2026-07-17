@@ -5,5 +5,3 @@ Para todas as movimentações preservar a quantidade de posições e salas
 Não utilizar as salas 1,2,3,4 e coworking
 Os clientes não devem ficar divididos em mais de 2 ambientes com exceção dos clientes 1, 3,4
 1 catraca a cada 250 PAS
-Deve ter 10 mesas do cliente 8 no mesmo ambiente do cliente 1 no bloco 2
-Criar um novo espaço apartado com 10 PAs no ambiente A do bloco 5
